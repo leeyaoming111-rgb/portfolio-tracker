@@ -1117,12 +1117,21 @@ def get_external_flows():
     current FX rate for manually-entered records.
     """
     flows = {}
+    seen = set()
     for d in get_deposits_from_db():
+        # Dedupe identical transfers recorded twice (e.g., entered manually
+        # AND synced from Flex with a different remark)
+        direction = (d.get("direction") or "IN").upper()
+        key = (d["date"], d.get("currency", "NZD"), round(abs(d["amount"]), 2), direction)
+        if key in seen:
+            continue
+        seen.add(key)
+
         base_amt = d.get("amount_base") or 0
         if not base_amt:
             base_amt = abs(d["amount"]) * fx_rate_for(d.get("currency", "NZD"))
         f = flows.setdefault(d["date"], {"in": 0.0, "out": 0.0})
-        if (d.get("direction") or "IN").upper() == "OUT":
+        if direction == "OUT":
             f["out"] += base_amt
         else:
             f["in"] += base_amt
@@ -1369,10 +1378,16 @@ def calculate_period_returns(twr_series):
     latest = twr_series[-1]
 
     def get_factor_at_date(target_date):
+        # PortfolioAnalyst convention: a period's base is the last valuation
+        # BEFORE the period starts (prior close), so the first day's return
+        # is included in the period.
+        prior = None
         for t in twr_series:
-            if t["date"] >= target_date:
-                return t["twr_factor"]
-        return twr_series[0]["twr_factor"]
+            if t["date"] < target_date:
+                prior = t
+            else:
+                break
+        return (prior or twr_series[0])["twr_factor"]
 
     def period_return(days_ago=None, target_date=None):
         if target_date:
@@ -2186,6 +2201,40 @@ def trigger_deposit_scan():
 
 # ── Returns / TWR Endpoints ───────────────────────────────────
 
+def _build_valuation_series(db, from_date, cutoff):
+    """
+    Build the daily NAV series for return calculations.
+
+    IMPORTANT: never mix valuation sources within the series. IBKR's Flex NAV
+    and local snapshots use different FX feeds, so a source switch mid-series
+    shows up as a fake daily return. When IBKR NAV exists we use ONLY it,
+    plus at most one live tail point (latest snapshot) so the chart reaches
+    today; that tail is replaced by IBKR's number on the next Flex sync.
+    """
+    nav_rows = db.execute(
+        "SELECT date, total FROM nav_history WHERE date >= ? ORDER BY date", (from_date,)
+    ).fetchall()
+    snap_rows = db.execute(
+        "SELECT timestamp, total_nav FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
+        (cutoff,),
+    ).fetchall()
+    snap_by_date = {}
+    for row in snap_rows:
+        snap_by_date[row["timestamp"][:10]] = row["total_nav"]  # last of the day wins
+
+    if nav_rows:
+        series = [{"date": r["date"], "total_nav": r["total"]} for r in nav_rows]
+        last_flex = series[-1]["date"]
+        tail_dates = sorted(d for d in snap_by_date if d > last_flex)
+        if tail_dates:
+            d = tail_dates[-1]
+            series.append({"date": d, "total_nav": snap_by_date[d], "live_tail": True})
+        return series, "flex_nav"
+
+    series = [{"date": d, "total_nav": v} for d, v in sorted(snap_by_date.items())]
+    return series, "snapshots"
+
+
 @app.get("/api/returns")
 def get_returns(days: int = Query(default=365, ge=1, le=3650)):
     """
@@ -2199,7 +2248,8 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
 
     db = get_db()
 
-    # ── Try IBKR TWR first (accurate, from Client Portal API) ──
+    # ── Try IBKR TWR first (PortfolioAnalyst data via Client Portal API),
+    #    but only if it's FRESH — stale partial syncs must not win over Flex ──
     ibkr_twr_available = False
     try:
         ibkr_rows = db.execute(
@@ -2207,31 +2257,14 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
             (from_date,)
         ).fetchall()
         if ibkr_rows and len(ibkr_rows) > 3:
-            ibkr_twr_available = True
+            freshness_cutoff = (date.today() - timedelta(days=7)).isoformat()
+            ibkr_twr_available = ibkr_rows[-1]["date"] >= freshness_cutoff
     except Exception:
         ibkr_rows = []
 
     flows = get_external_flows()
     mwr = None
-
-    # Build the daily valuation series: IBKR's official NAV history (Flex,
-    # base currency — the same series PortfolioAnalyst values against) wins;
-    # local snapshots fill any dates Flex doesn't cover.
-    nav_by_date = {}
-    snap_rows = db.execute(
-        "SELECT * FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
-        (cutoff,),
-    ).fetchall()
-    for row in snap_rows:
-        d = row["timestamp"][:10]
-        if d not in nav_by_date:
-            nav_by_date[d] = {"date": d, "total_nav": row["total_nav"], "source": "snapshot"}
-    nav_rows = db.execute(
-        "SELECT date, total FROM nav_history WHERE date >= ? ORDER BY date", (from_date,)
-    ).fetchall()
-    for r in nav_rows:
-        nav_by_date[r["date"]] = {"date": r["date"], "total_nav": r["total"], "source": "flex"}
-    valuation_series = sorted(nav_by_date.values(), key=lambda s: s["date"])
+    valuation_series, twr_source = _build_valuation_series(db, from_date, cutoff)
 
     if ibkr_twr_available:
         # Use IBKR's real TWR data (Client Portal /pa/performance)
@@ -2250,7 +2283,6 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
         twr_source = "ibkr"
     else:
         twr_series = calculate_twr(valuation_series, flows)
-        twr_source = "flex_nav" if any(s["source"] == "flex" for s in valuation_series) else "snapshots"
 
     # Money-weighted return (PortfolioAnalyst's second metric)
     if len(valuation_series) >= 2:
@@ -2315,6 +2347,73 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
             bk: {"label": cfg["label"], "color": cfg["color"]}
             for bk, cfg in BENCHMARKS.items()
         },
+    }
+
+
+@app.get("/api/returns/reconcile")
+def reconcile_returns(days: int = Query(default=90, ge=1, le=3650)):
+    """
+    Day-by-day TWR audit, for lining up against IBKR PortfolioAnalyst.
+    For each day: beginning NAV, ending NAV, deposits, withdrawals, the
+    daily return, and cumulative return. Also flags data problems
+    (flows outside the valuation range, valuation source, suspicious days).
+    """
+    from_date = (date.today() - timedelta(days=days)).isoformat()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    db = get_db()
+    valuation_series, source = _build_valuation_series(db, from_date, cutoff)
+    db.close()
+
+    flows = get_external_flows()
+    twr_series = calculate_twr(valuation_series, flows)
+
+    rows = []
+    sorted_flow_dates = sorted(flows.keys())
+    for i, t in enumerate(twr_series):
+        if i == 0:
+            continue
+        prev = twr_series[i - 1]
+        f_in = f_out = 0.0
+        for fd in sorted_flow_dates:
+            if prev["date"] < fd <= t["date"]:
+                f_in += flows[fd]["in"]
+                f_out += flows[fd]["out"]
+        daily_pct = round((t["twr_factor"] / prev["twr_factor"] - 1) * 100, 4)
+        rows.append({
+            "date": t["date"],
+            "begin_nav": round(prev["portfolio_value"], 2),
+            "end_nav": round(t["portfolio_value"], 2),
+            "deposits": round(f_in, 2),
+            "withdrawals": round(f_out, 2),
+            "daily_pct": daily_pct,
+            "cumulative_pct": t["twr_cumulative"],
+            # Big single-day moves with no flow usually mean a data problem
+            "suspicious": abs(daily_pct) > 8 and f_in == 0 and f_out == 0,
+        })
+
+    # Flows the TWR can't see (before the first valuation or after the last)
+    first_d = valuation_series[0]["date"] if valuation_series else None
+    last_d = valuation_series[-1]["date"] if valuation_series else None
+    orphan_flows = [
+        {"date": fd, **flows[fd]}
+        for fd in sorted_flow_dates
+        if first_d and (fd <= first_d or fd > last_d)
+    ]
+
+    return {
+        "source": source,
+        "valuation_points": len(valuation_series),
+        "first_date": first_d,
+        "last_date": last_d,
+        "final_twr_pct": twr_series[-1]["twr_cumulative"] if twr_series else None,
+        "days": rows,
+        "suspicious_days": [r for r in rows if r["suspicious"]],
+        "orphan_flows": orphan_flows,
+        "note": "Compare daily_pct/cumulative_pct with PortfolioAnalyst's daily "
+                "performance detail. orphan_flows are deposits/withdrawals outside "
+                "the valuation range (ignored by TWR); suspicious_days are large "
+                "moves with no recorded flow — usually a missing deposit record "
+                "or a bad NAV point.",
     }
 
 
