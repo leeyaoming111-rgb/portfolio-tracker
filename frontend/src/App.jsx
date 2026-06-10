@@ -1119,9 +1119,18 @@ export default function App() {
                 {returnData && (
                   <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
                     {[
-                      { label: "Total Deposited", value: fmtNzd(returnData.total_deposits) },
-                      { label: "Deposits", value: returnData.deposit_count },
-                      { label: "Snapshots", value: returnData.snapshot_count },
+                      { label: "Deposited", value: fmtNzd(returnData.total_deposits) },
+                      ...(returnData.total_withdrawals > 0
+                        ? [{ label: "Withdrawn", value: fmtNzd(returnData.total_withdrawals) }]
+                        : []),
+                      { label: "Net Contributions", value: fmtNzd(returnData.net_contributions ?? returnData.total_deposits) },
+                      ...(returnData.mwr?.period_pct != null
+                        ? [{ label: "MWR (money-weighted)", value: `${returnData.mwr.period_pct >= 0 ? "+" : ""}${returnData.mwr.period_pct}%` }]
+                        : []),
+                      { label: "Data points", value: returnData.snapshot_count },
+                      ...(returnData.twr_source
+                        ? [{ label: "Source", value: { ibkr: "IBKR PortfolioAnalyst", flex_nav: "IBKR daily NAV", snapshots: "Local snapshots" }[returnData.twr_source] || returnData.twr_source }]
+                        : []),
                     ].map((s, i) => (
                       <div key={i} style={{
                         background: "#0d1117", border: "1px solid #21262d", borderRadius: 6,
