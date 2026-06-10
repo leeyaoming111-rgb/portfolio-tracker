@@ -229,6 +229,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # Persistent company-name cache (filled from IBKR contract details only)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS name_cache (
+            key TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+
     # Insert default settings
     defaults = {
         "concentration_cap": "10.0",
@@ -380,44 +388,44 @@ class IBKRClient:
         exchange, currency = self.EXCHANGE_MAP.get(prefix, ("SMART", "USD"))
         return Stock(symbol, exchange, currency)
 
-    # Common stock name fallback (when reqContractDetails times out)
-    KNOWN_NAMES = {
-        "AAPL": "Apple Inc", "MSFT": "Microsoft Corp", "GOOGL": "Alphabet Inc",
-        "AMZN": "Amazon.com", "META": "Meta Platforms", "NVDA": "NVIDIA Corp",
-        "TSLA": "Tesla Inc", "CRM": "Salesforce Inc", "INTC": "Intel Corp",
-        "MU": "Micron Technology", "NOW": "ServiceNow", "SHOP": "Shopify",
-        "MELI": "MercadoLibre", "RDDT": "Reddit Inc", "HIMS": "Hims & Hers Health",
-        "COHR": "Coherent Corp", "VIAV": "VIAV Solutions", "KNX": "Knight-Swift",
-        "CLF": "Cleveland-Cliffs", "IREN": "Iris Energy", "ARM": "Arm Holdings",
-        "NBIS": "Nebius Group", "LITE": "Lumentum Holdings", "FPS": "First Person Inc",
-        "NVTS": "Navitas Semiconductor", "LPK": "LPKF Laser & Electronics",
-        "DRAM": "Pstg Semiconductor", "AVEX": "Aveva Group",
-        "6315": "TOWA Corp", "AL3": "AML3D Ltd",
-        "JPM": "JPMorgan Chase", "V": "Visa Inc", "UNH": "UnitedHealth",
-        "SPK": "Spark NZ", "AIR": "Air New Zealand",
-    }
-
     def _get_stock_name(self, contract):
         """
-        Fetch the long company name via reqContractDetails.
-        Falls back to KNOWN_NAMES map if the API times out.
+        Company name, from IBKR ONLY — never guessed.
+        Lookup order: in-memory cache → SQLite name_cache → reqContractDetails.
+        IBKR-sourced names persist in SQLite, so each contract is resolved
+        once ever. Until resolved, the plain ticker symbol is shown (a symbol
+        is never wrong; a guessed name can be).
         """
         key = f"{contract.symbol}_{getattr(contract, 'currency', 'USD')}"
         if key in self._name_cache:
             return self._name_cache[key]
-        # Try IBKR API first (short timeout)
+
+        db = get_db()
+        row = db.execute("SELECT name FROM name_cache WHERE key = ?", (key,)).fetchone()
+        if row:
+            db.close()
+            self._name_cache[key] = row["name"]
+            return row["name"]
+
+        name = None
         try:
             async def _fetch():
                 details = await self.ib.reqContractDetailsAsync(contract)
                 return details[0].longName if details else None
-            name = self._run_coro(_fetch(), timeout=3)
+            name = self._run_coro(_fetch(), timeout=5)
         except Exception:
             name = None
-        # Fallback to known names map
-        if not name:
-            name = self.KNOWN_NAMES.get(contract.symbol, contract.symbol)
-        self._name_cache[key] = name
-        return name
+
+        if name:
+            db.execute("INSERT OR REPLACE INTO name_cache (key, name) VALUES (?, ?)", (key, name))
+            db.commit()
+            db.close()
+            self._name_cache[key] = name
+            return name
+
+        db.close()
+        # Don't cache the fallback — retry IBKR on the next request
+        return contract.symbol
 
     # ── Portfolio / positions ──────────────────────────────────
 
@@ -2211,8 +2219,14 @@ def _build_valuation_series(db, from_date, cutoff):
     and local snapshots use different FX feeds, so a source switch mid-series
     shows up as a fake daily return. When IBKR NAV exists we use ONLY it.
     """
+    # Exclude today: a Flex report generated intraday includes TODAY's partial
+    # NAV (already containing any same-day deposit) while the deposit's cash
+    # transaction record hasn't posted yet — that pairing shows up as a huge
+    # fake daily return. PortfolioAnalyst likewise reports complete days only.
+    today_str = date.today().isoformat()
     nav_rows = db.execute(
-        "SELECT date, total FROM nav_history WHERE date >= ? ORDER BY date", (from_date,)
+        "SELECT date, total FROM nav_history WHERE date >= ? AND date < ? ORDER BY date",
+        (from_date, today_str),
     ).fetchall()
     snap_rows = db.execute(
         "SELECT timestamp, total_nav FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
