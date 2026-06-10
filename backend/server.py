@@ -392,40 +392,44 @@ class IBKRClient:
         """
         Company name, from IBKR ONLY — never guessed.
         Lookup order: in-memory cache → SQLite name_cache → reqContractDetails.
-        IBKR-sourced names persist in SQLite, so each contract is resolved
-        once ever. Until resolved, the plain ticker symbol is shown (a symbol
-        is never wrong; a guessed name can be).
+        Never raises — returns contract.symbol on any failure.
         """
-        key = f"{contract.symbol}_{getattr(contract, 'currency', 'USD')}"
+        symbol = getattr(contract, "symbol", "???")
+        key = f"{symbol}_{getattr(contract, 'currency', 'USD')}"
         if key in self._name_cache:
             return self._name_cache[key]
 
-        db = get_db()
-        row = db.execute("SELECT name FROM name_cache WHERE key = ?", (key,)).fetchone()
-        if row:
+        try:
+            db = get_db()
+            row = db.execute("SELECT name FROM name_cache WHERE key = ?", (key,)).fetchone()
             db.close()
-            self._name_cache[key] = row["name"]
-            return row["name"]
+            if row:
+                self._name_cache[key] = row["name"]
+                return row["name"]
+        except Exception:
+            pass
 
         name = None
         try:
             async def _fetch():
                 details = await self.ib.reqContractDetailsAsync(contract)
                 return details[0].longName if details else None
-            name = self._run_coro(_fetch(), timeout=5)
+            name = self._run_coro(_fetch(), timeout=3)
         except Exception:
-            name = None
+            pass
 
         if name:
-            db.execute("INSERT OR REPLACE INTO name_cache (key, name) VALUES (?, ?)", (key, name))
-            db.commit()
-            db.close()
             self._name_cache[key] = name
+            try:
+                db = get_db()
+                db.execute("INSERT OR REPLACE INTO name_cache (key, name) VALUES (?, ?)", (key, name))
+                db.commit()
+                db.close()
+            except Exception:
+                pass
             return name
 
-        db.close()
-        # Don't cache the fallback — retry IBKR on the next request
-        return contract.symbol
+        return symbol
 
     # ── Portfolio / positions ──────────────────────────────────
 
@@ -1533,9 +1537,14 @@ def get_portfolio():
 
     # Fetch positions + funds
     if USE_LIVE_API and ibkr_client and ibkr_client._connected:
-        positions = ibkr_client.get_positions()
-        funds = ibkr_client.get_account_funds()
-        cash_plus = funds.get("my_cash", 0)
+        try:
+            positions = ibkr_client.get_positions()
+            funds = ibkr_client.get_account_funds()
+            cash_plus = funds.get("my_cash", 0)
+        except Exception as e:
+            print(f"⚠️  Live position fetch failed: {e}")
+            positions = []
+            cash_plus = 0
     else:
         positions = DEMO_POSITIONS.copy()
         cash_plus = DEMO_FUND_ASSETS
