@@ -188,6 +188,33 @@ def init_db():
         )
     """)
 
+    # All cash movements from IBKR Flex (dividends, interest, fees, taxes, …)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS cash_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            type TEXT NOT NULL,
+            symbol TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL,
+            amount_base REAL DEFAULT 0,
+            UNIQUE(date, type, symbol, amount, currency, description)
+        )
+    """)
+
+    # Daily NAV in base currency, as reported by IBKR (Flex Equity Summary).
+    # This is the same valuation series PortfolioAnalyst uses for TWR.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS nav_history (
+            date TEXT PRIMARY KEY,
+            total REAL NOT NULL,
+            cash REAL DEFAULT 0,
+            stock REAL DEFAULT 0,
+            source TEXT DEFAULT 'flex'
+        )
+    """)
+
     # Migrate: add new columns to realized_pnl if missing
     for col, typ in [("cost_basis", "REAL DEFAULT 0"), ("cost_basis_nzd", "REAL DEFAULT 0"),
                      ("gain_pct", "REAL DEFAULT 0"), ("shares_sold", "REAL DEFAULT 0")]:
@@ -195,6 +222,12 @@ def init_db():
             c.execute(f"ALTER TABLE realized_pnl ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+    # Migrate: deposits gain amount_base (NZD value at IBKR's own FX rate on the day)
+    try:
+        c.execute("ALTER TABLE deposits ADD COLUMN amount_base REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
     # Insert default settings
     defaults = {
@@ -260,6 +293,7 @@ class IBKRClient:
         self._thread = None
         self._name_cache = {}       # contract key → long company name
         self._connected = False
+        self._pnl_sub = None        # account-level PnL subscription
 
     # ── Connection management ──────────────────────────────────
 
@@ -611,6 +645,108 @@ class IBKRClient:
             })
         return orders
 
+    # ── Account summary / margin / balances ────────────────────
+
+    # Account-level tags worth surfacing (all reported in base currency)
+    SUMMARY_TAGS = [
+        "NetLiquidation", "EquityWithLoanValue", "GrossPositionValue",
+        "TotalCashBalance", "TotalCashValue", "BuyingPower", "AvailableFunds",
+        "ExcessLiquidity", "Cushion", "FullInitMarginReq", "FullMaintMarginReq",
+        "InitMarginReq", "MaintMarginReq", "SMA", "Leverage",
+        "AccruedCash", "AccruedDividend", "DayTradesRemaining",
+        "LookAheadAvailableFunds", "LookAheadExcessLiquidity",
+        "RealizedPnL", "UnrealizedPnL",
+    ]
+
+    def get_account_summary_full(self):
+        """
+        Full account-level metrics (margin, buying power, liquidity, accruals)
+        plus per-currency cash and stock balances — mirrors what IBKR's
+        Account window / Client Portal shows.
+        """
+        values = self.ib.accountValues()
+        summary = {}
+        balances = {}   # currency → {cash, stock, net}
+        for v in values:
+            try:
+                val = float(v.value)
+            except (ValueError, TypeError):
+                continue
+            tag, cur = v.tag, v.currency
+
+            if tag in self.SUMMARY_TAGS and (cur in ("BASE", "", None) or tag not in summary):
+                summary[tag] = val
+
+            if cur and cur not in ("BASE", ""):
+                bal = balances.setdefault(cur, {"cash": 0.0, "stock": 0.0, "net": 0.0})
+                if tag == "CashBalance":
+                    bal["cash"] = val
+                elif tag == "StockMarketValue":
+                    bal["stock"] = val
+                elif tag == "NetLiquidationByCurrency":
+                    bal["net"] = val
+
+        return {"summary": summary, "balances_by_currency": balances}
+
+    def get_open_orders(self):
+        """Fetch all live/open orders (incl. those placed in TWS or mobile)."""
+        async def _fetch():
+            await self.ib.reqAllOpenOrdersAsync()
+            return list(self.ib.openTrades())
+
+        trades = self._run_coro(_fetch(), timeout=15)
+        orders = []
+        for trade in trades:
+            order = trade.order
+            status = trade.orderStatus
+            orders.append({
+                "code": self._contract_to_code(trade.contract),
+                "stock_name": getattr(trade.contract, "symbol", ""),
+                "order_id": str(order.orderId),
+                "perm_id": str(order.permId),
+                "order_type": order.orderType,
+                "order_status": status.status,
+                "trd_side": order.action,
+                "qty": float(order.totalQuantity),
+                "limit_price": float(order.lmtPrice) if order.lmtPrice else 0,
+                "aux_price": float(order.auxPrice) if order.auxPrice else 0,
+                "tif": order.tif,
+                "filled": float(status.filled),
+                "remaining": float(status.remaining),
+                "avg_fill_price": float(status.avgFillPrice),
+                "currency": getattr(trade.contract, "currency", "USD"),
+            })
+        return orders
+
+    def get_daily_pnl(self):
+        """
+        Account-level daily P&L via the reqPnL subscription
+        (same numbers as the TWS account header).
+        """
+        import math
+
+        if self._pnl_sub is None:
+            account = self.ib.managedAccounts()[0] if self.ib.managedAccounts() else ""
+
+            async def _subscribe():
+                pnl = self.ib.reqPnL(account)
+                # Wait briefly for the first update to arrive
+                for _ in range(20):
+                    await asyncio.sleep(0.25)
+                    if pnl.dailyPnL == pnl.dailyPnL:  # not NaN
+                        break
+                return pnl
+
+            self._pnl_sub = self._run_coro(_subscribe(), timeout=10)
+
+        p = self._pnl_sub
+        clean = lambda x: 0.0 if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
+        return {
+            "daily_pnl": round(clean(p.dailyPnL), 2),
+            "unrealized_pnl": round(clean(p.unrealizedPnL), 2),
+            "realized_pnl": round(clean(p.realizedPnL), 2),
+        }
+
 
 # Global client (only initialized if USE_LIVE_API)
 ibkr_client = IBKRClient() if USE_LIVE_API else None
@@ -638,14 +774,18 @@ BENCHMARKS = {
 # One-time setup (in IBKR Client Portal):
 #   1. Go to Performance & Reports → Flex Queries
 #   2. Create a new Activity Flex Query
-#   3. Include the "Cash Transactions" section, select all fields
+#   3. Include these sections (select all fields in each):
+#        - "Cash Transactions"  → deposits/withdrawals, dividends, interest, fees
+#        - "Equity Summary in Base" (by report date) → daily NAV, so TWR is
+#          computed on the exact valuations PortfolioAnalyst uses
+#        - "Trades" → realized P&L
 #   4. Set date period to "Last 365 Calendar Days"
 #   5. Save — note the Query ID
 #   6. Go to Flex Web Service Configuration → generate a token
 #   7. Save token to ~/.ibkr_flex_token
 #   8. Save query ID to ~/.ibkr_flex_query_id
 #
-# Once configured, deposits sync automatically on startup and
+# Once configured, everything syncs automatically on startup and
 # can be re-triggered via POST /api/deposits/scan.
 
 import xml.etree.ElementTree as ET
@@ -667,20 +807,18 @@ def _read_flex_config():
     return token, query_id
 
 
-def fetch_deposits_from_flex():
+def _fetch_flex_report():
     """
-    Fetch deposit/withdrawal history from IBKR Flex Web Service.
-
-    Two-step async flow:
-      1. POST SendRequest → get a reference code
-      2. GET GetStatement → download the XML report
-    Then parse CashTransactions for type='Deposits/Withdrawals'.
+    Download a Flex report via the two-step Flex Web Service flow:
+      1. GET SendRequest → reference code
+      2. GET GetStatement → XML report (retry while it generates)
+    Returns the raw XML text, or None.
     """
     token, query_id = _read_flex_config()
     if not token or not query_id:
         print("⚠️  Flex Query not configured — skipping deposit sync")
         print("   Create ~/.ibkr_flex_token and ~/.ibkr_flex_query_id")
-        return []
+        return None
 
     headers = {"User-Agent": "Python/3.12"}
 
@@ -696,17 +834,17 @@ def fetch_deposits_from_flex():
         if status != "Success":
             error_msg = root.findtext("ErrorMessage", "Unknown error")
             print(f"⚠️  Flex SendRequest failed: {error_msg}")
-            return []
+            return None
 
         ref_code = root.findtext("ReferenceCode")
         if not ref_code:
             print("⚠️  No reference code in Flex response")
-            return []
+            return None
 
         print(f"📋 Flex report requested (ref: {ref_code}), waiting for generation...")
     except Exception as e:
         print(f"⚠️  Flex SendRequest error: {e}")
-        return []
+        return None
 
     # Step 2: Wait, then fetch the report (retry up to 5 times)
     report_xml = None
@@ -729,79 +867,147 @@ def fetch_deposits_from_flex():
 
     if not report_xml or "<FlexQueryResponse" not in report_xml:
         print("⚠️  Could not retrieve Flex report after 5 attempts")
-        return []
+        return None
 
-    # Step 3: Parse CashTransactions for deposits/withdrawals
-    deposits = []
+    _last_flex_report["xml"] = report_xml  # Cache for realized P&L parsing
+    return report_xml
+
+
+def _normalize_flex_date(raw):
+    """Normalize IBKR's date formats (yyyyMMdd, yyyy-MM-dd, with ;HHMMSS suffix)."""
+    if ";" in raw:
+        raw = raw.split(";")[0]
+    raw = raw[:10]
+    if len(raw) == 8 and "-" not in raw:
+        raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return raw
+
+
+def parse_flex_report(report_xml):
+    """
+    Parse a Flex Activity report into:
+      deposits   — external cash flows (deposits/withdrawals), signed info preserved
+      cash_txns  — ALL cash transactions (dividends, interest, fees, taxes, …)
+      nav        — daily NAV in base currency (Equity Summary / Change in NAV sections)
+
+    fxRateToBase (IBKR's own FX rate on the transaction date) is used to express
+    every flow in base currency — exactly what PortfolioAnalyst does.
+    """
+    deposits, cash_txns, nav = [], [], []
     try:
         root = ET.fromstring(report_xml)
-        # Navigate: FlexQueryResponse → FlexStatements → FlexStatement → CashTransactions
         for stmt in root.iter("FlexStatement"):
             for txn in stmt.iter("CashTransaction"):
                 txn_type = txn.get("type", "")
-                if "Deposits" not in txn_type and "Withdrawals" not in txn_type:
-                    continue
-
                 amount = float(txn.get("amount", 0))
                 currency = txn.get("currency", "NZD")
-                txn_date = txn.get("dateTime", txn.get("reportDate", ""))
-                # IBKR sometimes appends ";HHMMSS" or ";N" to dates — strip it
-                if ";" in txn_date:
-                    txn_date = txn_date.split(";")[0]
-                txn_date = txn_date[:10]
+                txn_date = _normalize_flex_date(txn.get("dateTime", txn.get("reportDate", "")))
                 description = txn.get("description", "")
+                symbol = txn.get("symbol", "")
+                try:
+                    fx_to_base = float(txn.get("fxRateToBase", 0)) or None
+                except (ValueError, TypeError):
+                    fx_to_base = None
+                amount_base = amount * fx_to_base if fx_to_base else amount * fx_rate_for(currency)
 
-                # Normalize date format (IBKR uses yyyyMMdd or yyyy-MM-dd)
-                if len(txn_date) == 8 and "-" not in txn_date:
-                    txn_date = f"{txn_date[:4]}-{txn_date[4:6]}-{txn_date[6:8]}"
-
-                direction = "IN" if amount > 0 else "OUT"
-                deposits.append({
-                    "date": txn_date,
-                    "amount": abs(amount),
-                    "currency": currency,
-                    "remark": description or f"IBKR {txn_type}",
-                    "direction": direction,
+                cash_txns.append({
+                    "date": txn_date, "type": txn_type, "symbol": symbol,
+                    "description": description, "amount": amount,
+                    "currency": currency, "amount_base": round(amount_base, 2),
                 })
 
-        print(f"✅ Parsed {len(deposits)} deposit/withdrawal records from Flex Query")
-        _last_flex_report["xml"] = report_xml  # Cache for realized P&L parsing
+                if "Deposits" in txn_type or "Withdrawals" in txn_type:
+                    deposits.append({
+                        "date": txn_date,
+                        "amount": abs(amount),
+                        "currency": currency,
+                        "remark": description or f"IBKR {txn_type}",
+                        "direction": "IN" if amount > 0 else "OUT",
+                        "amount_base": round(abs(amount_base), 2),
+                    })
+
+            # Daily NAV in base currency — the valuation series PortfolioAnalyst uses
+            for eq in stmt.iter("EquitySummaryByReportDateInBase"):
+                d = _normalize_flex_date(eq.get("reportDate", ""))
+                total = float(eq.get("total", 0) or 0)
+                if d and total > 0:
+                    nav.append({
+                        "date": d, "total": total,
+                        "cash": float(eq.get("cash", 0) or 0),
+                        "stock": float(eq.get("stock", 0) or 0),
+                    })
+
+        print(f"✅ Flex parsed: {len(deposits)} deposits/withdrawals, "
+              f"{len(cash_txns)} cash transactions, {len(nav)} daily NAV records")
     except ET.ParseError as e:
         print(f"⚠️  Flex XML parse error: {e}")
     except Exception as e:
         print(f"⚠️  Flex processing error: {e}")
 
-    return deposits
+    return {"deposits": deposits, "cash_txns": cash_txns, "nav": nav}
+
+
+def fetch_deposits_from_flex():
+    """Fetch + parse the Flex report, returning deposit/withdrawal records."""
+    report_xml = _fetch_flex_report()
+    if not report_xml:
+        return []
+    return parse_flex_report(report_xml)["deposits"]
 
 
 def scan_and_store_deposits():
     """
-    Fetch deposits AND realized P&L from Flex Web Service and store in SQLite.
-    Skips duplicates via UNIQUE constraint.
+    Full Flex sync: deposits/withdrawals, all cash transactions (dividends,
+    interest, fees), daily NAV history, and realized P&L.
+    Skips duplicates via UNIQUE constraints.
     """
-    deposits = fetch_deposits_from_flex()
+    report_xml = _fetch_flex_report()
+    parsed = parse_flex_report(report_xml) if report_xml else {"deposits": [], "cash_txns": [], "nav": []}
 
     db = get_db()
 
-    # Store deposits
-    if deposits:
-        new_count = 0
-        for d in deposits:
-            try:
-                db.execute(
-                    """INSERT OR IGNORE INTO deposits (date, amount, currency, remark, direction)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (d["date"], d["amount"], d["currency"], d["remark"], d["direction"]),
-                )
-                if db.total_changes:
-                    new_count += 1
-            except sqlite3.IntegrityError:
-                pass
-        db.commit()
+    # Store deposits (update amount_base on existing rows that pre-date the column)
+    new_count = 0
+    for d in parsed["deposits"]:
+        cur = db.execute(
+            """INSERT OR IGNORE INTO deposits (date, amount, currency, remark, direction, amount_base)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (d["date"], d["amount"], d["currency"], d["remark"], d["direction"], d["amount_base"]),
+        )
+        if cur.rowcount > 0:
+            new_count += 1
+        else:
+            db.execute(
+                """UPDATE deposits SET amount_base = ?, direction = ?
+                   WHERE date = ? AND amount = ? AND currency = ? AND (amount_base IS NULL OR amount_base = 0)""",
+                (d["amount_base"], d["direction"], d["date"], d["amount"], d["currency"]),
+            )
+    if parsed["deposits"]:
         print(f"✅ Deposit sync complete. {new_count} new records stored.")
 
+    # Store all cash transactions
+    for t in parsed["cash_txns"]:
+        db.execute(
+            """INSERT OR IGNORE INTO cash_transactions
+               (date, type, symbol, description, amount, currency, amount_base)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (t["date"], t["type"], t["symbol"], t["description"],
+             t["amount"], t["currency"], t["amount_base"]),
+        )
+
+    # Store daily NAV history (IBKR's official base-currency valuations)
+    for n in parsed["nav"]:
+        db.execute(
+            """INSERT OR REPLACE INTO nav_history (date, total, cash, stock, source)
+               VALUES (?, ?, ?, ?, 'flex')""",
+            (n["date"], n["total"], n["cash"], n["stock"]),
+        )
+    if parsed["nav"]:
+        print(f"✅ Stored {len(parsed['nav'])} daily NAV records")
+
+    db.commit()
+
     # Also parse realized P&L from the same Flex report (if section exists)
-    # This is populated by fetch_deposits_from_flex's side effect of caching the report
     _sync_realized_from_flex(db)
 
     # Store last scan timestamp
@@ -895,10 +1101,31 @@ def get_deposits_from_db():
     """Retrieve all stored deposits from SQLite."""
     db = get_db()
     rows = db.execute(
-        "SELECT date, amount, currency, remark, direction FROM deposits ORDER BY date"
+        "SELECT date, amount, currency, remark, direction, amount_base FROM deposits ORDER BY date"
     ).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+def get_external_flows():
+    """
+    Build per-date external cash flows in base currency (NZD):
+      {date: {"in": deposits_nzd, "out": withdrawals_nzd}}
+
+    Uses IBKR's own fxRateToBase when synced via Flex; falls back to the
+    current FX rate for manually-entered records.
+    """
+    flows = {}
+    for d in get_deposits_from_db():
+        base_amt = d.get("amount_base") or 0
+        if not base_amt:
+            base_amt = abs(d["amount"]) * fx_rate_for(d.get("currency", "NZD"))
+        f = flows.setdefault(d["date"], {"in": 0.0, "out": 0.0})
+        if (d.get("direction") or "IN").upper() == "OUT":
+            f["out"] += base_amt
+        else:
+            f["in"] += base_amt
+    return flows
 
 
 # ── Benchmark Data (IBKR first, FMP fallback) ────────────────
@@ -997,45 +1224,30 @@ def get_benchmark_data(from_date_str, to_date_str, ticker="SPY"):
     return [{"date": r["date"], "close": r["close"]} for r in rows]
 
 
-# ── TWR Calculation ───────────────────────────────────────────
+# ── TWR / MWR Calculation (PortfolioAnalyst methodology) ─────
 
-def calculate_twr(snapshots_list, deposits_list):
+def calculate_twr(snapshots_list, flows_by_date):
     """
-    Calculate Time-Weighted Return series.
-    Strips out deposit effects so chart shows pure investment performance.
-    Uses Modified Dietz for sub-periods between deposits.
+    Time-Weighted Return series, matching IBKR PortfolioAnalyst:
+
+      - Daily valuation points (NAV in base currency).
+      - External flows only (deposits/withdrawals) — dividends, interest and
+        fees are performance, not flows.
+      - IBKR convention: deposits are weighted at the START of the day
+        (added to the denominator), withdrawals at the END of the day
+        (added back to the numerator).
+      - Daily returns are geometrically linked.
+
+      r_day = (EV + withdrawals) / (BV + deposits) - 1
+
+    flows_by_date: {date: {"in": deposits_nzd, "out": withdrawals_nzd}}
     Returns list of {date, twr_cumulative, twr_factor, portfolio_value, portfolio_indexed}.
     """
     if not snapshots_list:
         return []
 
-    # Build deposit lookup: {date_str: total_deposit_amount_nzd}
-    # Roll deposits on non-snapshot days to the next snapshot date
-    snap_dates = set(s["date"] for s in snapshots_list)
-    sorted_snap_dates = sorted(snap_dates)
-    raw_deposit_map = {}
-    for d in deposits_list:
-        dt = d["date"]
-        amt = d["amount"]
-        raw_deposit_map[dt] = raw_deposit_map.get(dt, 0) + amt
-
-    deposit_map = {}
-    for dep_date, amt in raw_deposit_map.items():
-        if dep_date in snap_dates:
-            deposit_map[dep_date] = deposit_map.get(dep_date, 0) + amt
-        else:
-            # Roll to next snapshot date
-            rolled = None
-            for sd in sorted_snap_dates:
-                if sd >= dep_date:
-                    rolled = sd
-                    break
-            if rolled:
-                deposit_map[rolled] = deposit_map.get(rolled, 0) + amt
-            # else: deposit before any snapshot, ignore
-
-    # Sort snapshots by date
     sorted_snaps = sorted(snapshots_list, key=lambda s: s["date"])
+    sorted_flow_dates = sorted(flows_by_date.keys())
 
     twr_series = []
     cumulative_factor = 1.0
@@ -1055,13 +1267,19 @@ def calculate_twr(snapshots_list, deposits_list):
         prev_value = prev_snap["total_nav"]
         curr_value = snap["total_nav"]
 
-        # Check if there was a deposit on this day
-        deposit_today = deposit_map.get(snap["date"], 0)
+        # All flows in (prev_date, curr_date] belong to this sub-period
+        # (handles weekend/missing-day flows by rolling them forward)
+        flow_in, flow_out = 0.0, 0.0
+        for fd in sorted_flow_dates:
+            if prev_snap["date"] < fd <= snap["date"]:
+                flow_in += flows_by_date[fd]["in"]
+                flow_out += flows_by_date[fd]["out"]
+            elif fd > snap["date"]:
+                break
 
-        # Sub-period return: end_value / (start_value + deposit) - 1
-        denominator = prev_value + deposit_today
+        denominator = prev_value + flow_in
         if denominator > 0:
-            sub_return = (curr_value / denominator) - 1
+            sub_return = (curr_value + flow_out) / denominator - 1
         else:
             sub_return = 0
 
@@ -1076,6 +1294,70 @@ def calculate_twr(snapshots_list, deposits_list):
         })
 
     return twr_series
+
+
+def calculate_mwr(snapshots_list, flows_by_date):
+    """
+    Money-Weighted Return (IRR), the second return metric PortfolioAnalyst
+    reports. Solves the rate where NPV of all flows = 0:
+      - t0: -starting NAV
+      - each flow date: -deposits + withdrawals
+      - end: +ending NAV
+    Returns {"period_pct", "annualized_pct"} or None.
+    """
+    if not snapshots_list or len(snapshots_list) < 2:
+        return None
+
+    sorted_snaps = sorted(snapshots_list, key=lambda s: s["date"])
+    start = sorted_snaps[0]
+    end = sorted_snaps[-1]
+    d0 = datetime.strptime(start["date"], "%Y-%m-%d").date()
+    d1 = datetime.strptime(end["date"], "%Y-%m-%d").date()
+    total_days = (d1 - d0).days
+    if total_days <= 0:
+        return None
+
+    # Build dated cash flows (years from start, amount)
+    cashflows = [(0.0, -start["total_nav"])]
+    for fd in sorted(flows_by_date.keys()):
+        if start["date"] < fd <= end["date"]:
+            f = flows_by_date[fd]
+            net = -f["in"] + f["out"]
+            if net != 0:
+                t = (datetime.strptime(fd, "%Y-%m-%d").date() - d0).days / 365.25
+                cashflows.append((t, net))
+    t_end = total_days / 365.25
+    cashflows.append((t_end, end["total_nav"]))
+
+    def npv(rate):
+        return sum(cf / (1 + rate) ** t for t, cf in cashflows)
+
+    # Bisection on the annualized rate; expand the upper bracket as needed
+    # (short periods with gains imply huge annualized IRRs)
+    lo, hi = -0.999999, 10.0
+    f_lo, f_hi = npv(lo), npv(hi)
+    while f_lo * f_hi > 0 and hi < 1e9:
+        hi *= 100
+        f_hi = npv(hi)
+    if f_lo * f_hi > 0:
+        return None  # no sign change — IRR not solvable
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        f_mid = npv(mid)
+        if abs(f_mid) < 1e-8:
+            break
+        if f_lo * f_mid < 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+    rate = (lo + hi) / 2
+
+    period = (1 + rate) ** t_end - 1
+    return {
+        # PortfolioAnalyst convention: only annualize periods longer than a year
+        "annualized_pct": round(rate * 100, 2) if total_days > 365 else None,
+        "period_pct": round(period * 100, 2),
+    }
 
 
 def calculate_period_returns(twr_series):
@@ -1306,11 +1588,18 @@ def get_portfolio():
 
     enriched.sort(key=lambda x: x["weight_pct"], reverse=True)
 
-    # Daily P&L total (in NZD, active only)
-    today_pl_total = sum(
-        p.get("today_pl", 0) * p.get("fx_rate", 1.0)
-        for p in active_positions
-    )
+    # Daily P&L total (in NZD) — account-level reqPnL when live
+    today_pl_total = 0
+    if USE_LIVE_API and ibkr_client and ibkr_client._connected:
+        try:
+            today_pl_total = ibkr_client.get_daily_pnl()["daily_pnl"]
+        except Exception as e:
+            print(f"⚠️  Daily PnL fetch failed: {e}")
+    if not today_pl_total:
+        today_pl_total = sum(
+            p.get("today_pl", 0) * p.get("fx_rate", 1.0)
+            for p in active_positions
+        )
 
     # Total realized P&L from stored records (all-time, includes closed positions)
     total_realized_nzd = sum(r.get("total_realized_nzd", 0) for r in stored_realized)
@@ -1572,6 +1861,139 @@ def get_order_history(days: int = Query(default=90, ge=1, le=365)):
     return {"orders": orders, "count": len(orders)}
 
 
+# ── Account / Orders / P&L (live IBKR) ────────────────────────
+
+def _require_live():
+    if not USE_LIVE_API or not ibkr_client or not ibkr_client._connected:
+        raise HTTPException(status_code=503, detail="Not connected to IBKR")
+
+
+@app.get("/api/account/summary")
+def get_account_summary():
+    """
+    Full account metrics: net liquidation, equity with loan, buying power,
+    available funds, excess liquidity, margin requirements, cushion, SMA,
+    leverage, accrued cash/dividends — plus per-currency balances.
+    """
+    _require_live()
+    data = ibkr_client.get_account_summary_full()
+    summary = data["summary"]
+    nlv = summary.get("NetLiquidation", 0)
+    gross = summary.get("GrossPositionValue", 0)
+    return {
+        **data,
+        "leverage": round(gross / nlv, 3) if nlv else 0,
+        "base_currency": "NZD",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/orders/open")
+def get_open_orders():
+    """All live/open orders (incl. orders placed in TWS or the mobile app)."""
+    _require_live()
+    orders = ibkr_client.get_open_orders()
+    for o in orders:
+        multiplier = fx_rate_for(o["currency"])
+        o["order_value"] = round(o["qty"] * (o["limit_price"] or o["avg_fill_price"]), 2)
+        o["order_value_nzd"] = round(o["order_value"] * multiplier, 2)
+    return {"orders": orders, "count": len(orders)}
+
+
+@app.get("/api/pnl/today")
+def get_today_pnl():
+    """Account-level daily P&L (same numbers as the TWS account header)."""
+    _require_live()
+    try:
+        return {**ibkr_client.get_daily_pnl(), "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PnL subscription failed: {e}")
+
+
+# ── Cash Transactions / Income (from Flex) ────────────────────
+
+@app.get("/api/cash-transactions")
+def get_cash_transactions(days: int = Query(default=365, ge=1, le=3650),
+                          type: Optional[str] = Query(default=None)):
+    """
+    All cash movements from IBKR: dividends, withholding tax, broker
+    interest, fees, deposits/withdrawals. Optional type filter (substring).
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    if type:
+        rows = db.execute(
+            "SELECT * FROM cash_transactions WHERE date >= ? AND type LIKE ? ORDER BY date DESC",
+            (cutoff, f"%{type}%"),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM cash_transactions WHERE date >= ? ORDER BY date DESC", (cutoff,)
+        ).fetchall()
+    db.close()
+    records = [dict(r) for r in rows]
+    by_type = {}
+    for r in records:
+        by_type[r["type"]] = round(by_type.get(r["type"], 0) + r["amount_base"], 2)
+    return {"transactions": records, "count": len(records), "totals_by_type_nzd": by_type}
+
+
+@app.get("/api/income/summary")
+def get_income_summary(days: int = Query(default=365, ge=1, le=3650)):
+    """
+    Investment income summary: dividends (gross & net of withholding tax),
+    interest, and fees — by symbol and by month, in NZD.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM cash_transactions WHERE date >= ? ORDER BY date", (cutoff,)
+    ).fetchall()
+    db.close()
+
+    dividends, tax, interest, fees = 0.0, 0.0, 0.0, 0.0
+    by_symbol, by_month = {}, {}
+    for r in rows:
+        t, amt = r["type"], r["amount_base"]
+        month = r["date"][:7]
+        if "Dividend" in t:
+            dividends += amt
+            sym = r["symbol"] or "?"
+            by_symbol[sym] = round(by_symbol.get(sym, 0) + amt, 2)
+            m = by_month.setdefault(month, {"dividends": 0.0, "interest": 0.0})
+            m["dividends"] = round(m["dividends"] + amt, 2)
+        elif "Withholding Tax" in t:
+            tax += amt
+        elif "Interest" in t:
+            interest += amt
+            m = by_month.setdefault(month, {"dividends": 0.0, "interest": 0.0})
+            m["interest"] = round(m["interest"] + amt, 2)
+        elif "Fee" in t or "Commission Adjustment" in t:
+            fees += amt
+
+    return {
+        "gross_dividends_nzd": round(dividends, 2),
+        "withholding_tax_nzd": round(tax, 2),
+        "net_dividends_nzd": round(dividends + tax, 2),  # tax amounts are negative
+        "interest_nzd": round(interest, 2),
+        "fees_nzd": round(fees, 2),
+        "by_symbol": dict(sorted(by_symbol.items(), key=lambda x: -x[1])),
+        "by_month": dict(sorted(by_month.items())),
+    }
+
+
+@app.get("/api/nav-history")
+def get_nav_history(days: int = Query(default=365, ge=1, le=3650)):
+    """Daily NAV in base currency, as reported by IBKR (Flex Equity Summary)."""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM nav_history WHERE date >= ? ORDER BY date", (cutoff,)
+    ).fetchall()
+    db.close()
+    return {"nav": [dict(r) for r in rows], "count": len(rows)}
+
+
 # ── Settings Endpoints ─────────────────────────────────────────
 
 @app.get("/api/settings")
@@ -1714,21 +2136,29 @@ def health():
 
 @app.get("/api/deposits")
 def get_deposits():
-    """Get all stored deposits."""
+    """Get all stored deposits/withdrawals with signed NZD totals."""
     deposits = get_deposits_from_db()
-    total = sum(d["amount"] for d in deposits)
-    return {"deposits": deposits, "total_deposited": total}
+    flows = get_external_flows()
+    total_in = sum(f["in"] for f in flows.values())
+    total_out = sum(f["out"] for f in flows.values())
+    return {
+        "deposits": deposits,
+        "total_deposited": round(total_in, 2),
+        "total_withdrawn": round(total_out, 2),
+        "net_contributions": round(total_in - total_out, 2),
+    }
 
 
 @app.post("/api/deposits")
 def add_deposit(d: DepositEntry):
     """Manually add a deposit record (fallback if Flex Query isn't configured)."""
+    amount_base = abs(d.amount) * fx_rate_for(d.currency)
     db = get_db()
     try:
         db.execute(
-            """INSERT OR IGNORE INTO deposits (date, amount, currency, remark, direction)
-               VALUES (?, ?, ?, ?, ?)""",
-            (d.date, d.amount, d.currency, d.remark, d.direction),
+            """INSERT OR IGNORE INTO deposits (date, amount, currency, remark, direction, amount_base)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (d.date, abs(d.amount), d.currency, d.remark, d.direction, round(amount_base, 2)),
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -1780,8 +2210,31 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
     except Exception:
         ibkr_rows = []
 
+    flows = get_external_flows()
+    mwr = None
+
+    # Build the daily valuation series: IBKR's official NAV history (Flex,
+    # base currency — the same series PortfolioAnalyst values against) wins;
+    # local snapshots fill any dates Flex doesn't cover.
+    nav_by_date = {}
+    snap_rows = db.execute(
+        "SELECT * FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
+        (cutoff,),
+    ).fetchall()
+    for row in snap_rows:
+        d = row["timestamp"][:10]
+        if d not in nav_by_date:
+            nav_by_date[d] = {"date": d, "total_nav": row["total_nav"], "source": "snapshot"}
+    nav_rows = db.execute(
+        "SELECT date, total FROM nav_history WHERE date >= ? ORDER BY date", (from_date,)
+    ).fetchall()
+    for r in nav_rows:
+        nav_by_date[r["date"]] = {"date": r["date"], "total_nav": r["total"], "source": "flex"}
+    valuation_series = sorted(nav_by_date.values(), key=lambda s: s["date"])
+
     if ibkr_twr_available:
-        # Use IBKR's real TWR data
+        # Use IBKR's real TWR data (Client Portal /pa/performance)
+        nav_lookup = {s["date"]: s["total_nav"] for s in valuation_series}
         twr_series = []
         for r in ibkr_rows:
             cum_pct = r["cumulative_pct"]
@@ -1790,34 +2243,17 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
                 "date": r["date"],
                 "twr_cumulative": cum_pct,
                 "twr_factor": factor,
-                "portfolio_value": 0,  # NAV not stored in ibkr_twr yet
+                "portfolio_value": nav_lookup.get(r["date"], 0),
                 "portfolio_indexed": round(100 * factor, 2),
             })
         twr_source = "ibkr"
     else:
-        # Fallback: snapshot-based TWR
-        snap_rows = db.execute(
-            "SELECT * FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
-            (cutoff,),
-        ).fetchall()
+        twr_series = calculate_twr(valuation_series, flows)
+        twr_source = "flex_nav" if any(s["source"] == "flex" for s in valuation_series) else "snapshots"
 
-        snapshots_for_twr = []
-        seen_dates = set()
-        for row in snap_rows:
-            ts = row["timestamp"]
-            d = ts[:10]
-            if d not in seen_dates:
-                seen_dates.add(d)
-                snapshots_for_twr.append({
-                    "date": d,
-                    "total_nav": row["total_nav"],
-                    "equity_nav": row["equity_nav"],
-                    "cash_plus": row["cash_plus"],
-                })
-
-        deposits = get_deposits_from_db()
-        twr_series = calculate_twr(snapshots_for_twr, deposits)
-        twr_source = "snapshots"
+    # Money-weighted return (PortfolioAnalyst's second metric)
+    if len(valuation_series) >= 2:
+        mwr = calculate_mwr(valuation_series, flows)
 
     db.close()
 
@@ -1860,11 +2296,18 @@ def get_returns(days: int = Query(default=365, ge=1, le=3650)):
     # Period returns
     period_returns = calculate_period_returns(twr_series)
 
+    # Signed, NZD-converted contribution totals
+    total_in = sum(f["in"] for f in flows.values())
+    total_out = sum(f["out"] for f in flows.values())
+
     return {
         "series": merged,
         "period_returns": period_returns,
+        "mwr": mwr,
         "twr_source": twr_source,
-        "total_deposits": sum(d["amount"] for d in deposits),
+        "total_deposits": round(total_in, 2),
+        "total_withdrawals": round(total_out, 2),
+        "net_contributions": round(total_in - total_out, 2),
         "deposit_count": len(deposits),
         "snapshot_count": len(twr_series),
         "benchmarks": {
