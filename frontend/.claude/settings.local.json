@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew upgrade:*)",
+      "Bash(wc:*)",
+      "Bash(brew install:*)",
+      "Bash(rm -rf venv)",
+      "Bash(python3.12 -m venv venv)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(unalias restartback:*)",
+      "Bash(source ~/.zshrc)",
+      "Bash(python -c \"from ib_async import IB; print\\(''ib_async OK''\\)\")",
+      "Bash(python -c \"import fastapi; print\\(''fastapi OK''\\)\")",
+      "Bash(ls:*)"
+    ]
+  }
+}
