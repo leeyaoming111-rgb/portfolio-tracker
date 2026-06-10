@@ -229,6 +229,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # Persistent company-name cache (filled from IBKR contract details only)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS name_cache (
+            key TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+
     # Insert default settings
     defaults = {
         "concentration_cap": "10.0",
@@ -380,44 +388,44 @@ class IBKRClient:
         exchange, currency = self.EXCHANGE_MAP.get(prefix, ("SMART", "USD"))
         return Stock(symbol, exchange, currency)
 
-    # Common stock name fallback (when reqContractDetails times out)
-    KNOWN_NAMES = {
-        "AAPL": "Apple Inc", "MSFT": "Microsoft Corp", "GOOGL": "Alphabet Inc",
-        "AMZN": "Amazon.com", "META": "Meta Platforms", "NVDA": "NVIDIA Corp",
-        "TSLA": "Tesla Inc", "CRM": "Salesforce Inc", "INTC": "Intel Corp",
-        "MU": "Micron Technology", "NOW": "ServiceNow", "SHOP": "Shopify",
-        "MELI": "MercadoLibre", "RDDT": "Reddit Inc", "HIMS": "Hims & Hers Health",
-        "COHR": "Coherent Corp", "VIAV": "VIAV Solutions", "KNX": "Knight-Swift",
-        "CLF": "Cleveland-Cliffs", "IREN": "Iris Energy", "ARM": "Arm Holdings",
-        "NBIS": "Nebius Group", "LITE": "Lumentum Holdings", "FPS": "First Person Inc",
-        "NVTS": "Navitas Semiconductor", "LPK": "LPKF Laser & Electronics",
-        "DRAM": "Pstg Semiconductor", "AVEX": "Aveva Group",
-        "6315": "TOWA Corp", "AL3": "AML3D Ltd",
-        "JPM": "JPMorgan Chase", "V": "Visa Inc", "UNH": "UnitedHealth",
-        "SPK": "Spark NZ", "AIR": "Air New Zealand",
-    }
-
     def _get_stock_name(self, contract):
         """
-        Fetch the long company name via reqContractDetails.
-        Falls back to KNOWN_NAMES map if the API times out.
+        Company name, from IBKR ONLY — never guessed.
+        Lookup order: in-memory cache → SQLite name_cache → reqContractDetails.
+        IBKR-sourced names persist in SQLite, so each contract is resolved
+        once ever. Until resolved, the plain ticker symbol is shown (a symbol
+        is never wrong; a guessed name can be).
         """
         key = f"{contract.symbol}_{getattr(contract, 'currency', 'USD')}"
         if key in self._name_cache:
             return self._name_cache[key]
-        # Try IBKR API first (short timeout)
+
+        db = get_db()
+        row = db.execute("SELECT name FROM name_cache WHERE key = ?", (key,)).fetchone()
+        if row:
+            db.close()
+            self._name_cache[key] = row["name"]
+            return row["name"]
+
+        name = None
         try:
             async def _fetch():
                 details = await self.ib.reqContractDetailsAsync(contract)
                 return details[0].longName if details else None
-            name = self._run_coro(_fetch(), timeout=3)
+            name = self._run_coro(_fetch(), timeout=5)
         except Exception:
             name = None
-        # Fallback to known names map
-        if not name:
-            name = self.KNOWN_NAMES.get(contract.symbol, contract.symbol)
-        self._name_cache[key] = name
-        return name
+
+        if name:
+            db.execute("INSERT OR REPLACE INTO name_cache (key, name) VALUES (?, ?)", (key, name))
+            db.commit()
+            db.close()
+            self._name_cache[key] = name
+            return name
+
+        db.close()
+        # Don't cache the fallback — retry IBKR on the next request
+        return contract.symbol
 
     # ── Portfolio / positions ──────────────────────────────────
 
@@ -1119,6 +1127,8 @@ def get_external_flows():
     flows = {}
     seen = set()
     for d in get_deposits_from_db():
+        # Normalize legacy rows with malformed dates (e.g., "20260423;1")
+        d["date"] = _normalize_flex_date(d["date"])
         # Dedupe identical transfers recorded twice (e.g., entered manually
         # AND synced from Flex with a different remark)
         direction = (d.get("direction") or "IN").upper()
@@ -2207,12 +2217,16 @@ def _build_valuation_series(db, from_date, cutoff):
 
     IMPORTANT: never mix valuation sources within the series. IBKR's Flex NAV
     and local snapshots use different FX feeds, so a source switch mid-series
-    shows up as a fake daily return. When IBKR NAV exists we use ONLY it,
-    plus at most one live tail point (latest snapshot) so the chart reaches
-    today; that tail is replaced by IBKR's number on the next Flex sync.
+    shows up as a fake daily return. When IBKR NAV exists we use ONLY it.
     """
+    # Exclude today: a Flex report generated intraday includes TODAY's partial
+    # NAV (already containing any same-day deposit) while the deposit's cash
+    # transaction record hasn't posted yet — that pairing shows up as a huge
+    # fake daily return. PortfolioAnalyst likewise reports complete days only.
+    today_str = date.today().isoformat()
     nav_rows = db.execute(
-        "SELECT date, total FROM nav_history WHERE date >= ? ORDER BY date", (from_date,)
+        "SELECT date, total FROM nav_history WHERE date >= ? AND date < ? ORDER BY date",
+        (from_date, today_str),
     ).fetchall()
     snap_rows = db.execute(
         "SELECT timestamp, total_nav FROM snapshots WHERE timestamp > ? ORDER BY timestamp ASC",
@@ -2223,12 +2237,12 @@ def _build_valuation_series(db, from_date, cutoff):
         snap_by_date[row["timestamp"][:10]] = row["total_nav"]  # last of the day wins
 
     if nav_rows:
+        # Use IBKR's NAV only, ending at IBKR's last reported day — exactly
+        # like PortfolioAnalyst, which also lags to the last complete day.
+        # No live tail point: NAV updates instantly on a deposit but the
+        # Flex flow record lags a day, so a same-day deposit would show up
+        # as a huge fake return.
         series = [{"date": r["date"], "total_nav": r["total"]} for r in nav_rows]
-        last_flex = series[-1]["date"]
-        tail_dates = sorted(d for d in snap_by_date if d > last_flex)
-        if tail_dates:
-            d = tail_dates[-1]
-            series.append({"date": d, "total_nav": snap_by_date[d], "live_tail": True})
         return series, "flex_nav"
 
     series = [{"date": d, "total_nav": v} for d, v in sorted(snap_by_date.items())]
@@ -2391,13 +2405,18 @@ def reconcile_returns(days: int = Query(default=90, ge=1, le=3650)):
             "suspicious": abs(daily_pct) > 8 and f_in == 0 and f_out == 0,
         })
 
-    # Flows the TWR can't see (before the first valuation or after the last)
     first_d = valuation_series[0]["date"] if valuation_series else None
     last_d = valuation_series[-1]["date"] if valuation_series else None
-    orphan_flows = [
-        {"date": fd, **flows[fd]}
-        for fd in sorted_flow_dates
-        if first_d and (fd <= first_d or fd > last_d)
+    # Flows before the first valuation are already embedded in the opening
+    # NAV — harmless. Flows after the last valuation are invisible to TWR
+    # until the next Flex sync delivers that day's NAV.
+    flows_before_start = [
+        {"date": fd, **flows[fd]} for fd in sorted_flow_dates
+        if first_d and fd <= first_d
+    ]
+    flows_after_end = [
+        {"date": fd, **flows[fd]} for fd in sorted_flow_dates
+        if last_d and fd > last_d
     ]
 
     return {
@@ -2408,12 +2427,15 @@ def reconcile_returns(days: int = Query(default=90, ge=1, le=3650)):
         "final_twr_pct": twr_series[-1]["twr_cumulative"] if twr_series else None,
         "days": rows,
         "suspicious_days": [r for r in rows if r["suspicious"]],
-        "orphan_flows": orphan_flows,
+        "flows_before_start": flows_before_start,
+        "flows_after_end": flows_after_end,
         "note": "Compare daily_pct/cumulative_pct with PortfolioAnalyst's daily "
-                "performance detail. orphan_flows are deposits/withdrawals outside "
-                "the valuation range (ignored by TWR); suspicious_days are large "
-                "moves with no recorded flow — usually a missing deposit record "
-                "or a bad NAV point.",
+                "performance detail. flows_before_start are embedded in the opening "
+                "NAV (harmless); flows_after_end aren't covered by NAV history yet "
+                "(wait for the next Flex sync). suspicious_days are large moves with "
+                "no recorded flow — usually a missing deposit record or a bad NAV "
+                "point. If valuation_points is small, increase the Flex Query date "
+                "period (use 'Last 365 Calendar Days').",
     }
 
 
