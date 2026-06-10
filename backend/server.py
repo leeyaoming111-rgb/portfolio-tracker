@@ -776,8 +776,9 @@ BENCHMARKS = {
 #   2. Create a new Activity Flex Query
 #   3. Include these sections (select all fields in each):
 #        - "Cash Transactions"  → deposits/withdrawals, dividends, interest, fees
-#        - "Equity Summary in Base" (by report date) → daily NAV, so TWR is
-#          computed on the exact valuations PortfolioAnalyst uses
+#        - "Net Asset Value (NAV) in Base" → daily NAV, so TWR is computed
+#          on the exact valuations PortfolioAnalyst uses
+#          (XML: EquitySummaryByReportDateInBase, one row per report date)
 #        - "Trades" → realized P&L
 #   4. Set date period to "Last 365 Calendar Days"
 #   5. Save — note the Query ID

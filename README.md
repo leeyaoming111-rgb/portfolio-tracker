@@ -8,7 +8,7 @@ FastAPI + React dashboard for managing an active equity portfolio via Interactiv
 as IBKR PortfolioAnalyst:
 
 - Valued daily against IBKR's official base-currency NAV series (synced from the
-  Flex "Equity Summary in Base" section), falling back to local snapshots.
+  Flex "Net Asset Value (NAV) in Base" section), falling back to local snapshots.
 - Only external flows (deposits/withdrawals) are stripped out — dividends,
   interest and fees count as performance.
 - Withdrawals are signed correctly, and flows are converted to NZD using IBKR's
@@ -26,7 +26,8 @@ In IBKR Client Portal → Performance & Reports → Flex Queries, create an
 Activity Flex Query with these sections (all fields):
 
 1. **Cash Transactions** — deposits/withdrawals, dividends, interest, fees
-2. **Equity Summary in Base** (by report date) — daily NAV for exact TWR
+2. **Net Asset Value (NAV) in Base** — daily NAV for exact TWR
+   (emits `EquitySummaryByReportDateInBase` rows, one per report date)
 3. **Trades** — realized P&L
 
 Period: "Last 365 Calendar Days". Then save the Web Service token to
