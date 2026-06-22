@@ -271,6 +271,10 @@ export default function App() {
   const [depositsData, setDepositsData] = useState(null);
   const [benchmarkDaily, setBenchmarkDaily] = useState(null);
 
+  // ── Realized P&L sync state ──
+  const [realizedSyncing, setRealizedSyncing] = useState(false);
+  const [realizedLastSync, setRealizedLastSync] = useState(null);
+
   // ── Deal History state ──
   const [dealHistory, setDealHistory] = useState(null);
   const [dealDays, setDealDays] = useState(90);
@@ -309,6 +313,24 @@ export default function App() {
       }
     } catch (e) {}
   }, []);
+
+  const syncRealizedPnl = useCallback(async () => {
+    setRealizedSyncing(true);
+    try {
+      const res = await fetch(`${API_BASE}/realized-pnl/sync`, { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === "ok") {
+          setRealizedLastSync(data.synced_at);
+          fetchPortfolio();
+        }
+      }
+    } catch (e) {
+      console.error("Realized P&L sync failed:", e);
+    } finally {
+      setRealizedSyncing(false);
+    }
+  }, [fetchPortfolio]);
 
   const fetchReturns = useCallback(async (days) => {
     setReturnsLoading(true);
@@ -805,12 +827,27 @@ export default function App() {
             {/* ── Realized P&L (All-Time, persisted) ── */}
             {((portfolio.stored_realized || []).length > 0 || (portfolio.closed_positions || []).length > 0) && (
               <div className="card" style={{ marginTop: 16 }}>
-                <div className="card-header">Realized P&L — All Positions</div>
+                <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>Realized P&L — All Positions</span>
+                <button
+                  onClick={syncRealizedPnl}
+                  disabled={realizedSyncing}
+                  style={{
+                    background: "rgba(136,192,208,0.15)", border: "1px solid rgba(136,192,208,0.3)",
+                    color: "#88c0d0", borderRadius: 4, padding: "3px 10px", fontSize: 11,
+                    cursor: realizedSyncing ? "wait" : "pointer", opacity: realizedSyncing ? 0.6 : 1,
+                  }}
+                >
+                  {realizedSyncing ? "Syncing..." : "Refresh from IBKR"}
+                </button>
+              </div>
                 <div style={{ overflowX: "auto" }}>
                   <table>
                     <thead>
                       <tr>
                         <th>Ticker</th>
+                        <th style={{ textAlign: "right" }}>Shares Sold</th>
+                        <th style={{ textAlign: "right" }}>Cost Basis</th>
                         <th style={{ textAlign: "right" }}>Realized P&L</th>
                         <th style={{ textAlign: "right" }}>Realized (NZD)</th>
                         <th style={{ textAlign: "right" }}>Gain %</th>
@@ -823,11 +860,19 @@ export default function App() {
                         const realNzd = p.total_realized_nzd || p.realized_pl_nzd || 0;
                         const realNative = p.total_realized || p.realized_pl || 0;
                         const gainPct = p.gain_pct || 0;
+                        const sharesSold = p.shares_sold || 0;
+                        const costBasis = p.cost_basis || 0;
                         return (
                           <tr key={i}>
                             <td style={{ fontWeight: 600 }}>
                               <div>{p.stock_name || p.ticker || p.code}</div>
                               <div style={{ fontSize: 10, color: "#8b949e", fontWeight: 400 }}>{p.ticker || p.code}</div>
+                            </td>
+                            <td className="mono" style={{ textAlign: "right", color: "#c9d1d9" }}>
+                              {sharesSold > 0 ? fmt(sharesSold, sharesSold % 1 === 0 ? 0 : 2) : "\u2014"}
+                            </td>
+                            <td className="mono" style={{ textAlign: "right", color: "#8b949e" }}>
+                              {costBasis > 0 ? `${sym} ${fmt(costBasis, costBasis >= 1000 ? 0 : 2)}` : "\u2014"}
                             </td>
                             <td className="mono" style={{
                               textAlign: "right",
