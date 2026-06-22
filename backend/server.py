@@ -1020,8 +1020,9 @@ def scan_and_store_deposits():
 
     db.commit()
 
-    # Also parse realized P&L from the same Flex report (if section exists)
+    # Sync realized P&L: first from Flex (all-time), then from TWS fills (recent)
     _sync_realized_from_flex(db)
+    _sync_realized_from_fills(db)
 
     # Store last scan timestamp
     db.execute(
@@ -1104,6 +1105,72 @@ def _sync_realized_from_flex(db):
         print(f"✅ Synced {len(agg)} realized P&L records from Flex trades")
     except Exception as e:
         print(f"⚠️  Realized P&L sync error: {e}")
+
+
+def _sync_realized_from_fills(db):
+    """Sync realized P&L from TWS session fills — covers recent trades not yet in Flex."""
+    if not (USE_LIVE_API and ibkr_client and ibkr_client._connected):
+        return
+
+    try:
+        fills = ibkr_client.ib.fills()
+        agg = {}
+        for fill in fills:
+            ex = fill.execution
+            c = fill.contract
+            if ex.side != "SLD":
+                continue
+            rpnl = float(getattr(fill, "commissionReport", None) and fill.commissionReport.realizedPNL or 0)
+            if rpnl == 0:
+                continue
+
+            currency = getattr(c, "currency", "USD")
+            prefix_map = {"NZD": "NZ", "USD": "US", "MYR": "MY", "JPY": "JP",
+                          "AUD": "AU", "GBP": "UK", "EUR": "EU"}
+            prefix = prefix_map.get(currency, currency[:2])
+            symbol = getattr(c, "symbol", "")
+            ticker = f"{prefix}.{symbol}"
+            qty = abs(float(ex.shares))
+            price = float(ex.price)
+            cost = float(ex.avgPrice) * qty
+
+            if ticker in agg:
+                agg[ticker]["realized"] += rpnl
+                agg[ticker]["cost"] += cost
+                agg[ticker]["shares"] += qty
+            else:
+                agg[ticker] = {
+                    "realized": rpnl, "cost": cost, "shares": qty,
+                    "symbol": symbol, "currency": currency,
+                    "company": ibkr_client._get_stock_name(c),
+                }
+
+        count = 0
+        for ticker, d in agg.items():
+            existing = db.execute(
+                "SELECT cost_basis FROM realized_pnl WHERE ticker = ?", (ticker,)
+            ).fetchone()
+            if existing and existing["cost_basis"] and existing["cost_basis"] > 0:
+                continue
+            multiplier = fx_rate_for(d["currency"])
+            realized_nzd = round(d["realized"] * multiplier, 2)
+            cost_nzd = round(d["cost"] * multiplier, 2)
+            gain_pct = round((d["realized"] / d["cost"]) * 100, 2) if d["cost"] > 0 else 0
+            db.execute(
+                """INSERT OR REPLACE INTO realized_pnl
+                   (ticker, stock_name, currency, total_realized, total_realized_nzd,
+                    cost_basis, cost_basis_nzd, gain_pct, shares_sold, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                (ticker, d["company"], d["currency"], d["realized"], realized_nzd,
+                 d["cost"], cost_nzd, gain_pct, d["shares"]),
+            )
+            count += 1
+
+        if count > 0:
+            db.commit()
+            print(f"✅ Synced {count} realized P&L records from TWS fills")
+    except Exception as e:
+        print(f"⚠️  TWS fills sync error: {e}")
 
 
 def get_deposits_from_db():
@@ -1562,10 +1629,17 @@ def get_portfolio():
     closed_positions = [p for p in positions if p["qty"] == 0 and p.get("realized_pl", 0) != 0]
 
     # Persist realized P&L to SQLite (survives after positions are closed)
+    # Only update if no Flex-sourced record exists (Flex records have cost_basis populated)
     db = get_db()
     for p in positions:
         realized = p.get("realized_pl", 0)
         if realized != 0:
+            existing = db.execute(
+                "SELECT cost_basis FROM realized_pnl WHERE ticker = ?", (p["code"],)
+            ).fetchone()
+            if existing and existing["cost_basis"] and existing["cost_basis"] > 0:
+                # Flex-sourced record exists with richer data — don't overwrite
+                continue
             db.execute(
                 """INSERT OR REPLACE INTO realized_pnl
                    (ticker, stock_name, currency, total_realized, total_realized_nzd, last_updated)
@@ -2149,13 +2223,13 @@ def get_realized_pnl():
 
 @app.post("/api/realized-pnl/sync")
 def sync_realized_pnl():
-    """Re-fetch Flex report and re-sync realized P&L from scratch."""
+    """Re-fetch Flex report and re-sync realized P&L, then supplement with TWS fills."""
     try:
         report_xml = _fetch_flex_report()
-        if not report_xml:
-            return {"status": "error", "message": "Could not fetch Flex report"}
         db = get_db()
-        _sync_realized_from_flex(db)
+        if report_xml:
+            _sync_realized_from_flex(db)
+        _sync_realized_from_fills(db)
         rows = db.execute("SELECT * FROM realized_pnl ORDER BY total_realized_nzd DESC").fetchall()
         db.close()
         records = [dict(r) for r in rows]
