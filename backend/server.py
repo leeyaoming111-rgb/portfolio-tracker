@@ -1036,76 +1036,72 @@ _last_flex_report = {"xml": None}  # Cache last Flex report for realized P&L par
 
 
 def _sync_realized_from_flex(db):
-    """Parse realized P&L from the cached Flex report XML."""
+    """Parse realized P&L from the cached Flex report XML.
+    Aggregates all closing trades per ticker from scratch each run to avoid double-counting.
+    """
     xml_text = _last_flex_report.get("xml")
     if not xml_text:
         return
 
     try:
         root = ET.fromstring(xml_text)
-        count = 0
+        # Aggregate all closing trades in memory first, then write once
+        agg = {}  # ticker -> {realized, cost, shares, symbol, currency}
         for stmt in root.iter("FlexStatement"):
-            # Look for trades to compute realized P&L
             for trade in stmt.iter("Trade"):
-                # Only closed trades (selling existing positions)
                 code_str = trade.get("openCloseIndicator", "")
-                if code_str not in ("C", "C;O"):  # C = closing trade
+                if code_str not in ("C", "C;O"):
                     continue
 
                 symbol = trade.get("symbol", "")
                 currency = trade.get("currency", "USD")
                 realized = float(trade.get("fifoPnlRealized", 0))
                 cost = float(trade.get("cost", 0))
-                proceeds = float(trade.get("proceeds", 0))
                 qty = abs(float(trade.get("quantity", 0)))
 
                 if realized == 0 or not symbol:
                     continue
 
-                # Build ticker code
                 prefix_map = {"NZD": "NZ", "USD": "US", "MYR": "MY", "JPY": "JP",
                               "AUD": "AU", "GBP": "UK", "EUR": "EU"}
                 prefix = prefix_map.get(currency, currency[:2])
                 ticker = f"{prefix}.{symbol}"
 
-                # Convert to NZD
-                multiplier = fx_rate_for(currency)
-                realized_nzd = round(realized * multiplier, 2)
-                cost_nzd = round(abs(cost) * multiplier, 2)
-                gain_pct = round((realized / abs(cost)) * 100, 2) if cost != 0 else 0
-
-                # Accumulate per ticker (might have multiple trades)
-                existing = db.execute(
-                    "SELECT total_realized, cost_basis, shares_sold FROM realized_pnl WHERE ticker = ?",
-                    (ticker,)
-                ).fetchone()
-
-                if existing:
-                    new_realized = existing["total_realized"] + realized
-                    new_cost = existing["cost_basis"] + abs(cost)
-                    new_shares = existing["shares_sold"] + qty
+                if ticker in agg:
+                    agg[ticker]["realized"] += realized
+                    agg[ticker]["cost"] += abs(cost)
+                    agg[ticker]["shares"] += qty
                 else:
-                    new_realized = realized
-                    new_cost = abs(cost)
-                    new_shares = qty
+                    agg[ticker] = {
+                        "realized": realized,
+                        "cost": abs(cost),
+                        "shares": qty,
+                        "symbol": symbol,
+                        "currency": currency,
+                    }
 
-                new_realized_nzd = round(new_realized * multiplier, 2)
-                new_cost_nzd = round(new_cost * multiplier, 2)
-                new_gain_pct = round((new_realized / new_cost) * 100, 2) if new_cost > 0 else 0
+        if not agg:
+            return
 
-                db.execute(
-                    """INSERT OR REPLACE INTO realized_pnl
-                       (ticker, stock_name, currency, total_realized, total_realized_nzd,
-                        cost_basis, cost_basis_nzd, gain_pct, shares_sold, last_updated)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-                    (ticker, symbol, currency, new_realized, new_realized_nzd,
-                     new_cost, new_cost_nzd, new_gain_pct, new_shares),
-                )
-                count += 1
+        # Clear old Flex-sourced records and write fresh aggregates
+        db.execute("DELETE FROM realized_pnl")
+        for ticker, d in agg.items():
+            multiplier = fx_rate_for(d["currency"])
+            realized_nzd = round(d["realized"] * multiplier, 2)
+            cost_nzd = round(d["cost"] * multiplier, 2)
+            gain_pct = round((d["realized"] / d["cost"]) * 100, 2) if d["cost"] > 0 else 0
 
-        if count > 0:
-            db.commit()
-            print(f"✅ Synced {count} realized P&L records from Flex trades")
+            db.execute(
+                """INSERT INTO realized_pnl
+                   (ticker, stock_name, currency, total_realized, total_realized_nzd,
+                    cost_basis, cost_basis_nzd, gain_pct, shares_sold, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                (ticker, d["symbol"], d["currency"], d["realized"], realized_nzd,
+                 d["cost"], cost_nzd, gain_pct, d["shares"]),
+            )
+
+        db.commit()
+        print(f"✅ Synced {len(agg)} realized P&L records from Flex trades")
     except Exception as e:
         print(f"⚠️  Realized P&L sync error: {e}")
 
@@ -2149,6 +2145,25 @@ def get_realized_pnl():
     records = [dict(r) for r in rows]
     total = sum(r.get("total_realized_nzd", 0) for r in records)
     return {"records": records, "total_nzd": round(total, 2)}
+
+
+@app.post("/api/realized-pnl/sync")
+def sync_realized_pnl():
+    """Re-fetch Flex report and re-sync realized P&L from scratch."""
+    try:
+        report_xml = _fetch_flex_report()
+        if not report_xml:
+            return {"status": "error", "message": "Could not fetch Flex report"}
+        db = get_db()
+        _sync_realized_from_flex(db)
+        rows = db.execute("SELECT * FROM realized_pnl ORDER BY total_realized_nzd DESC").fetchall()
+        db.close()
+        records = [dict(r) for r in rows]
+        total = sum(r.get("total_realized_nzd", 0) for r in records)
+        return {"status": "ok", "records": records, "total_nzd": round(total, 2),
+                "synced_at": datetime.now().isoformat()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 # ── Health ─────────────────────────────────────────────────────
