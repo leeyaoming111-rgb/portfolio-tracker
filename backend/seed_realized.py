@@ -38,6 +38,11 @@ if __name__ == "__main__":
             print(f"Imported {result.get('imported', 0)} records")
             print(f"Total realized (NZD): {result.get('total_nzd', 0):,.2f}")
             print(f"Status: {result.get('status')}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        print(f"Error: {e}")
+        print(f"Response body: {body}")
+        print("Make sure the backend is running and you pulled the latest code + restarted it.")
     except Exception as e:
         print(f"Error: {e}")
         print("Make sure the backend is running at http://localhost:8000")
