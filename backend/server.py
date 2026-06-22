@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -2221,23 +2221,97 @@ def get_realized_pnl():
     return {"records": records, "total_nzd": round(total, 2)}
 
 
+def _import_realized_records(db, trade_list):
+    """Import realized P&L records from a list of trade aggregates."""
+    prefix_map = {"NZD": "NZ", "USD": "US", "MYR": "MY", "JPY": "JP",
+                  "AUD": "AU", "GBP": "UK", "EUR": "EU"}
+    count = 0
+    for t in trade_list:
+        currency = t.get("currency", "USD")
+        prefix = prefix_map.get(currency, currency[:2])
+        symbol = t.get("symbol", t.get("ticker", ""))
+        ticker = symbol if "." in symbol else f"{prefix}.{symbol}"
+        realized = float(t.get("realized", t.get("total_realized", 0)))
+        cost = abs(float(t.get("cost", t.get("cost_basis", 0))))
+        shares = float(t.get("shares", t.get("shares_sold", 0)))
+        company = t.get("company", t.get("stock_name", symbol))
+
+        if realized == 0:
+            continue
+
+        multiplier = fx_rate_for(currency)
+        realized_nzd = round(realized * multiplier, 2)
+        cost_nzd = round(cost * multiplier, 2)
+        gain_pct = round((realized / cost) * 100, 2) if cost > 0 else 0
+
+        db.execute(
+            """INSERT OR REPLACE INTO realized_pnl
+               (ticker, stock_name, currency, total_realized, total_realized_nzd,
+                cost_basis, cost_basis_nzd, gain_pct, shares_sold, last_updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (ticker, company, currency, realized, realized_nzd,
+             cost, cost_nzd, gain_pct, shares),
+        )
+        count += 1
+
+    if count > 0:
+        db.commit()
+        print(f"✅ Imported {count} realized P&L records")
+    return count
+
+
 @app.post("/api/realized-pnl/sync")
 def sync_realized_pnl():
-    """Re-fetch Flex report and re-sync realized P&L, then supplement with TWS fills."""
+    """Re-sync realized P&L from all available sources: Flex, TWS fills, CP API."""
+    db = get_db()
+    sources_tried = []
     try:
         report_xml = _fetch_flex_report()
-        db = get_db()
         if report_xml:
             _sync_realized_from_flex(db)
+            sources_tried.append("flex")
+
         _sync_realized_from_fills(db)
+        sources_tried.append("tws_fills")
+
+        try:
+            from ibkr_cpapi import IBKRPortalClient
+            cp = IBKRPortalClient()
+            if cp.check_auth():
+                cp_trades = cp.get_trades(days=90)
+                if cp_trades:
+                    _import_realized_records(db, cp_trades)
+                    sources_tried.append(f"cpapi({len(cp_trades)})")
+        except Exception as e:
+            print(f"⚠️  CP API trade sync skipped: {e}")
+
         rows = db.execute("SELECT * FROM realized_pnl ORDER BY total_realized_nzd DESC").fetchall()
         db.close()
         records = [dict(r) for r in rows]
         total = sum(r.get("total_realized_nzd", 0) for r in records)
         return {"status": "ok", "records": records, "total_nzd": round(total, 2),
-                "synced_at": datetime.now().isoformat()}
+                "sources": sources_tried, "synced_at": datetime.now().isoformat()}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.put("/api/realized-pnl/import")
+async def import_realized_pnl(request: Request):
+    """Import realized P&L data from external source.
+    Accepts JSON array of: {ticker, stock_name, currency, total_realized, cost_basis, shares_sold}
+    """
+    body = await request.json()
+    records = body if isinstance(body, list) else body.get("records", [])
+    if not records:
+        return {"status": "error", "message": "No records provided"}
+    db = get_db()
+    count = _import_realized_records(db, records)
+    rows = db.execute("SELECT * FROM realized_pnl ORDER BY total_realized_nzd DESC").fetchall()
+    db.close()
+    all_records = [dict(r) for r in rows]
+    total = sum(r.get("total_realized_nzd", 0) for r in all_records)
+    return {"status": "ok", "imported": count, "records": all_records,
+            "total_nzd": round(total, 2)}
 
 
 # ── Health ─────────────────────────────────────────────────────

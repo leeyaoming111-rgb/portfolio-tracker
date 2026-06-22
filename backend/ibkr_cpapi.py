@@ -227,6 +227,53 @@ class IBKRPortalClient:
                     continue
         return str(d)[:10]
 
+    # ── Trades ─────────────────────────────────────────────────
+
+    def get_trades(self, days=90):
+        """Fetch recent trades via the CP Gateway."""
+        self.ping()
+        if not self.account_id:
+            self.get_accounts()
+        if not self.account_id:
+            return []
+
+        result = self._request("POST", "/pa/transactions", data={
+            "acctIds": [self.account_id],
+            "conids": [],
+            "currency": "USD",
+            "days": days,
+        })
+        if not result:
+            result = self._request("GET", "/iserver/account/trades")
+        if not result:
+            return []
+
+        trades = result if isinstance(result, list) else result.get("transactions", result.get("trades", []))
+        sells = {}
+        for t in trades:
+            side = (t.get("side") or t.get("type") or "").upper()
+            if "SELL" not in side and "SLD" not in side:
+                continue
+            sym = t.get("symbol") or t.get("conid_symbol") or ""
+            if not sym or "/" in sym:
+                continue
+            currency = t.get("currency", "USD")
+            rpnl = float(t.get("realized_pnl", t.get("realizedPnl", 0)) or 0)
+            qty = abs(float(t.get("size", t.get("quantity", t.get("qty", 0))) or 0))
+            price = float(t.get("price", 0) or 0)
+            net = float(t.get("net_amount", t.get("netAmount", 0)) or 0)
+            cost = abs(net - rpnl) if net and rpnl else qty * price
+
+            if sym not in sells:
+                sells[sym] = {"realized": 0, "cost": 0, "shares": 0,
+                              "currency": currency,
+                              "company": t.get("company_name", t.get("description", sym))}
+            sells[sym]["realized"] += rpnl
+            sells[sym]["cost"] += cost
+            sells[sym]["shares"] += qty
+
+        return [{"symbol": s, **d} for s, d in sells.items() if d["realized"] != 0]
+
     # ── Summary ────────────────────────────────────────────────
 
     def get_summary(self, account_id=None):
