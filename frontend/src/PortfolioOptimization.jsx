@@ -32,7 +32,7 @@ export default function PortfolioOptimization() {
     setLoading(true); setError("");
     const cap = Math.max(1, Math.min(100, Number(form.max_position_pct) || 15));
     try {
-      const response = await fetchWithTimeout(`${API_BASE}/optimization?max_position_pct=${cap}`);
+      const response = await fetchWithTimeout(`${API_BASE}/optimization?max_position_pct=${cap}`, {}, 60000);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not calculate portfolio risk");
       setReport(data);
@@ -46,7 +46,7 @@ export default function PortfolioOptimization() {
     try {
       const response = await fetchWithTimeout(`${API_BASE}/optimization/size`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(form),
-      });
+      }, 120000);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not size candidate");
       setSizing(data);
@@ -69,8 +69,6 @@ export default function PortfolioOptimization() {
       <button className="btn" onClick={loadReport} disabled={loading}>{loading ? "Calculating…" : "Refresh risk"}</button>
     </div>
     {error && <div style={{ background: "rgba(248,81,73,.1)", border: "1px solid #da3633", color: "#f85149", padding: 12, borderRadius: 6, marginBottom: 16 }}>{error}</div>}
-
-    {!report && !loading && !error && <div className="card" style={{ marginBottom: 18, color: "#8b949e", textAlign: "center", padding: "32px 0" }}>No risk data yet. Press "Refresh risk" to fetch price history and build the report.</div>}
 
     {report && <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(120px, 1fr))", gap: 12, marginBottom: 18 }}>
