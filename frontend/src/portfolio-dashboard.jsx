@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Treemap, ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, Legend, BarChart, Bar, Cell, CartesianGrid, ReferenceLine, Area, ComposedChart } from "recharts";
 import IndustryScreener from "./IndustryScreener";
+import PortfolioOptimization from "./PortfolioOptimization";
 
 // ── Config ──
 const API_BASE = "http://localhost:8000/api";
@@ -82,7 +83,7 @@ const TreemapCell = ({ x, y, width, height, name, drift, weight_pct, concentrati
 };
 
 // ── Tabs ──
-const TABS = ["Dashboard", "Returns", "Allocation", "Rebalance", "History", "Screener"];
+const TABS = ["Dashboard", "Returns", "Allocation", "Optimise", "Rebalance", "History", "Screener"];
 
 // ── Conviction Editor Component ──
 // Handles inline editing of thesis, catalysts, invalidations, and valuation for a single position.
@@ -524,6 +525,8 @@ export default function App() {
 
       {/* ── Main Content ── */}
       <main style={{ padding: "20px 24px" }}>
+
+        {activeTab === "Optimise" && <PortfolioOptimization />}
 
         {/* ════ DASHBOARD TAB ════ */}
         {activeTab === "Dashboard" && (

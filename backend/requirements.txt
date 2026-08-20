@@ -12,6 +12,7 @@ ib_async==2.1.0
 idna==3.13
 nest-asyncio==1.6.0
 numpy==2.4.4
+pandas==2.3.3
 pydantic==2.13.3
 pydantic_core==2.46.3
 starlette==1.0.0
@@ -19,3 +20,4 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.3
 uvicorn==0.46.0
+skfolio==0.20.2

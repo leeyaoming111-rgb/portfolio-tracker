@@ -21,6 +21,7 @@ import os
 import sqlite3
 import time
 import threading
+import pandas as pd
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from portfolio_optimizer import build_optimization_report, size_candidate_position
 
 # ── Screener (FMP proxy) ──
 from screener import screener_router
@@ -87,6 +89,49 @@ def fx_rate_for(currency):
     rates = get_fx_rates()
     rate = rates.get(currency, 1.0)
     return 1.0 / rate if rate > 0 else 1.0
+
+
+_optimization_cache = {"key": None, "prices": None, "fetched_at": 0}
+
+
+def _optimization_positions():
+    """Return the same live position payload used by the dashboard."""
+    payload = get_portfolio()
+    positions = [p for p in payload.get("positions", []) if p.get("weight_pct", 0) > 0]
+    return payload, positions
+
+
+def _fetch_optimization_prices(positions, days=430):
+    if not (USE_LIVE_API and ibkr_client and ibkr_client._connected):
+        raise HTTPException(status_code=503, detail="IBKR is not connected")
+
+    codes = sorted(p["code"] for p in positions)
+    cache_key = (tuple(codes), days)
+    now = time.time()
+    if _optimization_cache["key"] == cache_key and now - _optimization_cache["fetched_at"] < 3600:
+        return _optimization_cache["prices"]
+
+    start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    end = date.today().strftime("%Y-%m-%d")
+    prices = {}
+    for position in positions:
+        try:
+            bars = ibkr_client.get_history_kline(position["code"], start, end)
+            series = pd.Series(
+                {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
+                dtype=float,
+            ).sort_index()
+            if len(series) >= 60:
+                prices[position["code"]] = series
+        except Exception as exc:
+            print(f"⚠️  Optimisation history failed for {position['code']}: {exc}")
+
+    _optimization_cache.update({"key": cache_key, "prices": prices, "fetched_at": now})
+    return prices
+
+
+def _price_returns(prices):
+    return {ticker: series.pct_change().dropna() for ticker, series in prices.items()}
 
 DB_PATH = Path(__file__).parent / "portfolio.db"
 
@@ -1527,6 +1572,13 @@ class DepositEntry(BaseModel):
     remark: str = "Manual deposit"
     direction: str = "IN"
 
+class PositionSizeRequest(BaseModel):
+    ticker: str
+    expected_return_pct: float
+    conviction: int = 3
+    max_position_pct: float = 15.0
+    risk_free_rate_pct: float = 4.5
+
 
 # ── App ────────────────────────────────────────────────────────
 
@@ -1728,6 +1780,89 @@ def get_portfolio():
         "timestamp": datetime.now().isoformat(),
         "is_live": USE_LIVE_API and ibkr_client is not None and ibkr_client._connected,
     }
+
+
+@app.get("/api/optimization")
+def get_optimization(max_position_pct: float = Query(15.0, ge=1.0, le=100.0)):
+    """Risk snapshot and HRP comparison using the live IBKR book."""
+    payload, positions = _optimization_positions()
+    if len(positions) < 2:
+        raise HTTPException(status_code=422, detail="At least two live positions are required")
+    try:
+        prices = _fetch_optimization_prices(positions)
+        report = build_optimization_report(
+            positions,
+            _price_returns(prices),
+            total_nav=payload["total_nav"],
+            cash_nzd=payload["cash_plus"],
+            max_weight_pct=max_position_pct,
+        )
+        report.update({
+            "total_nav_nzd": payload["total_nav"],
+            "cash_nzd": payload["cash_plus"],
+            "lookback": "Trailing daily history from IBKR, up to 430 calendar days",
+            "methodology": "Hierarchical Risk Parity using standard deviation; advisory only",
+        })
+        return report
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/optimization/size")
+def size_optimization_candidate(request: PositionSizeRequest):
+    """Size a candidate against live holdings. Does not save targets or place trades."""
+    ticker = request.ticker.strip().upper()
+    if "." not in ticker:
+        ticker = f"US.{ticker}"
+    if request.expected_return_pct <= request.risk_free_rate_pct:
+        raise HTTPException(status_code=422, detail="Expected return must exceed the risk-free rate")
+
+    payload, positions = _optimization_positions()
+    try:
+        prices = _fetch_optimization_prices(positions)
+        start = (date.today() - timedelta(days=430)).strftime("%Y-%m-%d")
+        end = date.today().strftime("%Y-%m-%d")
+        if ibkr_client is None or not ibkr_client._connected:
+            raise HTTPException(status_code=503, detail="IBKR is not connected")
+        bars = ibkr_client.get_history_kline(ticker, start, end)
+        candidate_prices = pd.Series(
+            {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
+            dtype=float,
+        ).sort_index()
+        if len(candidate_prices) < 60:
+            raise HTTPException(status_code=422, detail=f"Not enough IBKR price history for {ticker}")
+
+        candidate_returns = candidate_prices.pct_change().dropna()
+        history = _price_returns(prices)
+        history[ticker] = candidate_returns
+        aligned = pd.concat(history, axis=1, join="inner").dropna()
+        if len(aligned) < 60:
+            raise HTTPException(status_code=422, detail="Not enough overlapping history to size this candidate")
+
+        current = next((p for p in positions if p["code"] == ticker), None)
+        current_value_nzd = float(current["val_nzd"]) if current else 0.0
+        currency = current["currency"] if current else ("USD" if ticker.startswith("US.") else "NZD")
+        result = size_candidate_position(
+            positions=positions,
+            existing_returns={column: aligned[column] for column in aligned.columns if column != ticker},
+            candidate_code=ticker,
+            candidate_returns=aligned[ticker],
+            expected_return_pct=request.expected_return_pct,
+            conviction=request.conviction,
+            total_nav=payload["total_nav"],
+            available_cash_nzd=max(payload["cash_plus"], 0),
+            current_position_nzd=current_value_nzd,
+            candidate_price_nzd=float(candidate_prices.iloc[-1]) * fx_rate_for(currency),
+            max_position_pct=request.max_position_pct,
+            risk_free_rate_pct=request.risk_free_rate_pct,
+        )
+        result["stock_name"] = current["stock_name"] if current else ticker.split(".", 1)[-1]
+        result["price_currency_note"] = "Share count uses the latest IBKR price converted to NZD"
+        return result
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/rebalance")
