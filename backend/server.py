@@ -102,19 +102,33 @@ def _optimization_positions():
 
 
 def _fetch_optimization_prices(positions, days=430):
+    """Fetch historical prices for the optimisation calculations.
+
+    IBKR's free tier rate-limits historical data requests aggressively. We cap
+    the number of tickers per call, pace requests, and return whatever we were
+    able to collect (the optimiser drops tickers without enough history).
+    """
     if not (USE_LIVE_API and ibkr_client and ibkr_client._connected):
         raise HTTPException(status_code=503, detail="IBKR is not connected")
 
-    codes = sorted(p["code"] for p in positions)
-    cache_key = (tuple(codes), days)
+    # Cap at 8 tickers per call. The live book has 20+; we optimise on the
+    # largest positions by NZD value and rotate the rest on subsequent calls.
+    ranked = sorted(positions, key=lambda p: p.get("val_nzd", 0), reverse=True)
+    sample = ranked[:8]
+
+    codes = tuple(p["code"] for p in sample)
+    cache_key = ("sample", codes, days)
     now = time.time()
-    if _optimization_cache["key"] == cache_key and now - _optimization_cache["fetched_at"] < 3600:
+    if (
+        _optimization_cache["key"] == cache_key
+        and now - _optimization_cache["fetched_at"] < 1800  # 30 min TTL
+    ):
         return _optimization_cache["prices"]
 
     start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
     end = date.today().strftime("%Y-%m-%d")
     prices = {}
-    for position in positions:
+    for position in sample:
         try:
             bars = ibkr_client.get_history_kline(position["code"], start, end)
             series = pd.Series(
@@ -125,6 +139,8 @@ def _fetch_optimization_prices(positions, days=430):
                 prices[position["code"]] = series
         except Exception as exc:
             print(f"⚠️  Optimisation history failed for {position['code']}: {exc}")
+        # 2s pause between calls. IBKR delayed data is ~60 requests / 10 min.
+        time.sleep(2)
 
     _optimization_cache.update({"key": cache_key, "prices": prices, "fetched_at": now})
     return prices

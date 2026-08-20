@@ -13,15 +13,16 @@ export default function PortfolioOptimization() {
 
   const loadReport = useCallback(async () => {
     setLoading(true); setError("");
+    const cap = Math.max(1, Math.min(100, Number(form.max_position_pct) || 15));
     try {
-      const response = await fetch(`${API_BASE}/optimization?max_position_pct=${form.max_position_pct}`);
+      const response = await fetch(`${API_BASE}/optimization?max_position_pct=${cap}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not calculate portfolio risk");
       setReport(data);
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   }, [form.max_position_pct]);
 
-  useEffect(() => { loadReport(); }, [loadReport]);
+  useEffect(() => { loadReport(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const calculateSize = async (event) => {
     event.preventDefault(); setSizingBusy(true); setSizing(null); setError("");
