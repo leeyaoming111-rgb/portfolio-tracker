@@ -4,7 +4,14 @@
       "Bash(brew upgrade:*)",
       "Bash(gh auth:*)",
       "Bash(~/portfolio-tracker/backend/venv/bin/pip freeze:*)",
-      "Bash(brew install:*)"
+      "Bash(brew install:*)",
+      "Bash(gh repo:*)",
+      "Bash(pip install *)",
+      "Bash(python3 -m pip install pypdf reportlab)",
+      "Bash(python3 -m pip install pypdf reportlab --break-system-packages)",
+      "Bash(python3 build_third_point_book.py)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('Scripts:', list\\(d.get\\('scripts',{}\\).keys\\(\\)\\)\\); print\\('Deps:', list\\(d.get\\('dependencies',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(git push *)"
     ]
   }
 }
