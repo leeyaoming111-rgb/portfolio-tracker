@@ -11,15 +11,32 @@ export default function PortfolioOptimization() {
   const [sizing, setSizing] = useState(null);
   const [sizingBusy, setSizingBusy] = useState(false);
 
+  // Fetch with a hard timeout so a stalled backend (e.g. IBKR rate limits)
+  // surfaces as an error instead of "Calculating…" forever.
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = 45000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const describeError = (err) =>
+    err.name === "AbortError"
+      ? "Request timed out. Price history may be unavailable — check the backend logs, network, and IB Gateway."
+      : err.message;
+
   const loadReport = useCallback(async () => {
     setLoading(true); setError("");
     const cap = Math.max(1, Math.min(100, Number(form.max_position_pct) || 15));
     try {
-      const response = await fetch(`${API_BASE}/optimization?max_position_pct=${cap}`);
+      const response = await fetchWithTimeout(`${API_BASE}/optimization?max_position_pct=${cap}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not calculate portfolio risk");
       setReport(data);
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+    } catch (err) { setError(describeError(err)); } finally { setLoading(false); }
   }, [form.max_position_pct]);
 
   useEffect(() => { loadReport(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -27,13 +44,13 @@ export default function PortfolioOptimization() {
   const calculateSize = async (event) => {
     event.preventDefault(); setSizingBusy(true); setSizing(null); setError("");
     try {
-      const response = await fetch(`${API_BASE}/optimization/size`, {
+      const response = await fetchWithTimeout(`${API_BASE}/optimization/size`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(form),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not size candidate");
       setSizing(data);
-    } catch (err) { setError(err.message); } finally { setSizingBusy(false); }
+    } catch (err) { setError(describeError(err)); } finally { setSizingBusy(false); }
   };
 
   const inputStyle = { background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, color: "#e6edf3", padding: "9px 10px", width: "100%", fontFamily: "inherit" };
@@ -52,6 +69,8 @@ export default function PortfolioOptimization() {
       <button className="btn" onClick={loadReport} disabled={loading}>{loading ? "Calculating…" : "Refresh risk"}</button>
     </div>
     {error && <div style={{ background: "rgba(248,81,73,.1)", border: "1px solid #da3633", color: "#f85149", padding: 12, borderRadius: 6, marginBottom: 16 }}>{error}</div>}
+
+    {!report && !loading && !error && <div className="card" style={{ marginBottom: 18, color: "#8b949e", textAlign: "center", padding: "32px 0" }}>No risk data yet. Press "Refresh risk" to fetch price history and build the report.</div>}
 
     {report && <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(120px, 1fr))", gap: 12, marginBottom: 18 }}>

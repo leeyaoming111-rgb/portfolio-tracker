@@ -50,15 +50,29 @@ MARKET_DATA_TYPE = 3     # 3 = Delayed (free), 1 = Live (requires subscription)
 # ── Live FX Rate ───────────────────────────────────────────────
 import urllib.request
 
-_fx_cache = {"rates": {"NZD": 1.0, "USD": 0.625, "JPY": 93.0}, "fetched_at": 0}
+_fx_cache = {"rates": {"NZD": 1.0, "USD": 0.625, "JPY": 93.0}, "fetched_at": 0,
+             "failures": 0, "last_failure": 0}
+
+# Circuit breaker: after this many consecutive failures, stop hitting the
+# network for FX_COOLDOWN seconds and serve the cached/fallback rates. Without
+# this, a dead DNS resolver floods the logs with a failed request on every
+# portfolio call (get_fx_rates is on the hot path of /api/portfolio).
+FX_MAX_FAILURES = 3
+FX_COOLDOWN = 600  # 10 minutes
 
 def get_fx_rates():
     """Fetch all FX rates with NZD as base, cached 1 hour.
     Returns dict: {"USD": 0.625, "JPY": 93.5, "NZD": 1.0, ...}
     To convert X to NZD: value_in_x / rates[X]
+    Serves cached rates without retrying while the circuit breaker is open.
     """
     now = time.time()
     if now - _fx_cache["fetched_at"] < 3600:
+        return _fx_cache["rates"]
+    if (
+        _fx_cache["failures"] >= FX_MAX_FAILURES
+        and now - _fx_cache["last_failure"] < FX_COOLDOWN
+    ):
         return _fx_cache["rates"]
     try:
         url = "https://open.er-api.com/v6/latest/NZD"
@@ -68,10 +82,16 @@ def get_fx_rates():
             rates = data["rates"]
             _fx_cache["rates"] = rates
             _fx_cache["fetched_at"] = now
+            _fx_cache["failures"] = 0
             print(f"📈 FX updated: 1 NZD = {rates.get('USD',0):.4f} USD, {rates.get('JPY',0):.2f} JPY")
             return rates
     except Exception as e:
-        print(f"⚠️  FX fetch failed: {e}")
+        _fx_cache["failures"] += 1
+        _fx_cache["last_failure"] = now
+        if _fx_cache["failures"] == FX_MAX_FAILURES:
+            print(f"⚠️  FX fetch failed {FX_MAX_FAILURES}x — pausing retries for {FX_COOLDOWN // 60} min: {e}")
+        elif _fx_cache["failures"] < FX_MAX_FAILURES:
+            print(f"⚠️  FX fetch failed: {e}")
         return _fx_cache["rates"]
 
 def to_nzd(value, currency):
@@ -93,6 +113,94 @@ def fx_rate_for(currency):
 
 _optimization_cache = {"key": None, "prices": None, "fetched_at": 0}
 
+# Primary historical price source for the optimiser. yfinance is unmetered and
+# batch-downloads the whole book in one request; IBKR delayed data times out
+# constantly (~60 req / 10 min) and was the cause of the tab hanging for 60s+.
+# Set to "ibkr" to restore the old behaviour (top-8 sample, 2s pacing).
+OPTIMIZATION_PRICE_SOURCE = "yfinance"
+
+# Internal code prefix → Yahoo Finance suffix.
+_YF_SUFFIX = {"US": "", "NZ": ".NZ", "AU": ".AX", "JP": ".T", "UK": ".L",
+              "HK": ".HK", "SG": ".SI", "CA": ".TO", "KR": ".KS", "TW": ".TW",
+              "MY": ".KL", "EU": ".PA"}
+
+
+def _yf_symbol(code):
+    """Convert internal ticker (US.AAPL, JP.6315, HK.700) to a Yahoo symbol."""
+    parts = code.split(".", 1)
+    if len(parts) != 2:
+        return code
+    prefix, symbol = parts
+    if prefix == "HK":
+        symbol = symbol.zfill(4)  # Yahoo wants 0700.HK, not 700.HK
+    return f"{symbol}{_YF_SUFFIX.get(prefix, '')}"
+
+
+def _fetch_prices_yfinance(codes, days=430, min_observations=60):
+    """Batch-fetch daily closes for many tickers from Yahoo in one request.
+
+    Returns {internal_code: pd.Series} for every ticker with enough history.
+    Never raises — callers treat missing tickers as 'no data'.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("⚠️  yfinance not installed — pip install yfinance")
+        return {}
+
+    symbol_map = {_yf_symbol(code): code for code in codes}
+    try:
+        data = yf.download(
+            list(symbol_map.keys()),
+            period=f"{days}d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception as exc:
+        print(f"⚠️  yfinance batch download failed: {exc}")
+        return {}
+
+    prices = {}
+    for yf_sym, code in symbol_map.items():
+        try:
+            if len(symbol_map) == 1:
+                closes = data["Close"]
+            else:
+                closes = data[yf_sym]["Close"]
+            series = closes.dropna().astype(float)
+            series.index = pd.to_datetime(series.index).tz_localize(None)
+            if len(series) >= min_observations:
+                prices[code] = series.sort_index()
+        except (KeyError, TypeError):
+            continue
+    return prices
+
+
+def _fetch_single_price_history(code, days=430):
+    """Fetch one ticker's daily closes: yfinance first, IBKR as fallback.
+
+    Used for sizing candidates that may not be in the current book.
+    Returns a pd.Series (possibly empty).
+    """
+    series = _fetch_prices_yfinance([code], days=days).get(code)
+    if series is not None:
+        return series
+    if USE_LIVE_API and ibkr_client and ibkr_client._connected:
+        start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        end = date.today().strftime("%Y-%m-%d")
+        try:
+            bars = ibkr_client.get_history_kline(code, start, end)
+            return pd.Series(
+                {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
+                dtype=float,
+            ).sort_index()
+        except Exception as exc:
+            print(f"⚠️  IBKR history failed for {code}: {exc}")
+    return pd.Series(dtype=float)
+
 
 def _optimization_positions():
     """Return the same live position payload used by the dashboard."""
@@ -104,43 +212,51 @@ def _optimization_positions():
 def _fetch_optimization_prices(positions, days=430):
     """Fetch historical prices for the optimisation calculations.
 
-    IBKR's free tier rate-limits historical data requests aggressively. We cap
-    the number of tickers per call, pace requests, and return whatever we were
-    able to collect (the optimiser drops tickers without enough history).
+    Primary source is yfinance (one batched request, whole book, no rate
+    limits). Any tickers Yahoo can't resolve are gap-filled from IBKR with
+    pacing. If both sources return nothing, raise a clear 503 so the frontend
+    can show a no-data state instead of hanging.
     """
-    if not (USE_LIVE_API and ibkr_client and ibkr_client._connected):
-        raise HTTPException(status_code=503, detail="IBKR is not connected")
-
-    # Cap at 8 tickers per call. The live book has 20+; we optimise on the
-    # largest positions by NZD value and rotate the rest on subsequent calls.
-    ranked = sorted(positions, key=lambda p: p.get("val_nzd", 0), reverse=True)
-    sample = ranked[:8]
-
-    codes = tuple(p["code"] for p in sample)
-    cache_key = ("sample", codes, days)
+    codes = tuple(sorted(p["code"] for p in positions))
+    cache_key = (OPTIMIZATION_PRICE_SOURCE, codes, days)
     now = time.time()
     if (
         _optimization_cache["key"] == cache_key
-        and now - _optimization_cache["fetched_at"] < 1800  # 30 min TTL
+        and now - _optimization_cache["fetched_at"] < 3600  # 1 hour TTL
     ):
         return _optimization_cache["prices"]
 
-    start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-    end = date.today().strftime("%Y-%m-%d")
     prices = {}
-    for position in sample:
-        try:
-            bars = ibkr_client.get_history_kline(position["code"], start, end)
-            series = pd.Series(
-                {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
-                dtype=float,
-            ).sort_index()
-            if len(series) >= 60:
-                prices[position["code"]] = series
-        except Exception as exc:
-            print(f"⚠️  Optimisation history failed for {position['code']}: {exc}")
-        # 2s pause between calls. IBKR delayed data is ~60 requests / 10 min.
-        time.sleep(2)
+    if OPTIMIZATION_PRICE_SOURCE == "yfinance":
+        prices = _fetch_prices_yfinance(codes, days=days)
+        missing = [p for p in positions if p["code"] not in prices]
+    else:
+        missing = sorted(positions, key=lambda p: p.get("val_nzd", 0), reverse=True)[:8]
+
+    # Gap-fill from IBKR, largest positions first, capped and paced so a
+    # rate-limited gateway can't stall the request for minutes.
+    if missing and USE_LIVE_API and ibkr_client and ibkr_client._connected:
+        start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        end = date.today().strftime("%Y-%m-%d")
+        ranked = sorted(missing, key=lambda p: p.get("val_nzd", 0), reverse=True)[:8]
+        for position in ranked:
+            try:
+                bars = ibkr_client.get_history_kline(position["code"], start, end)
+                series = pd.Series(
+                    {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
+                    dtype=float,
+                ).sort_index()
+                if len(series) >= 60:
+                    prices[position["code"]] = series
+            except Exception as exc:
+                print(f"⚠️  Optimisation history failed for {position['code']}: {exc}")
+            time.sleep(2)  # IBKR delayed data is ~60 requests / 10 min
+
+    if not prices:
+        raise HTTPException(
+            status_code=503,
+            detail="No price history available from yfinance or IBKR. Check network/DNS and IB Gateway.",
+        )
 
     _optimization_cache.update({"key": cache_key, "prices": prices, "fetched_at": now})
     return prices
@@ -1836,17 +1952,9 @@ def size_optimization_candidate(request: PositionSizeRequest):
     payload, positions = _optimization_positions()
     try:
         prices = _fetch_optimization_prices(positions)
-        start = (date.today() - timedelta(days=430)).strftime("%Y-%m-%d")
-        end = date.today().strftime("%Y-%m-%d")
-        if ibkr_client is None or not ibkr_client._connected:
-            raise HTTPException(status_code=503, detail="IBKR is not connected")
-        bars = ibkr_client.get_history_kline(ticker, start, end)
-        candidate_prices = pd.Series(
-            {pd.to_datetime(bar["date"]): float(bar["close"]) for bar in bars if bar.get("close")},
-            dtype=float,
-        ).sort_index()
+        candidate_prices = _fetch_single_price_history(ticker)
         if len(candidate_prices) < 60:
-            raise HTTPException(status_code=422, detail=f"Not enough IBKR price history for {ticker}")
+            raise HTTPException(status_code=422, detail=f"Not enough price history for {ticker} from yfinance or IBKR")
 
         candidate_returns = candidate_prices.pct_change().dropna()
         history = _price_returns(prices)

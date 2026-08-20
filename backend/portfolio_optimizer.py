@@ -190,7 +190,10 @@ def size_candidate_position(
     candidate_positions.append({
         "code": candidate_code,
         "stock_name": candidate_code,
-        "val_nzd": max(current_position_nzd, 1.0),
+        # 0.0 for a new position: HRP weights come from the returns frame, not
+        # val_nzd, so the candidate still gets an HRP row while the current-book
+        # metrics reflect the actual holdings (no phantom $1 position).
+        "val_nzd": max(current_position_nzd, 0.0),
     })
     report = build_optimization_report(
         candidate_positions,

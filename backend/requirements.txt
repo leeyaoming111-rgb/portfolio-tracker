@@ -21,3 +21,4 @@ typing_extensions==4.15.0
 tzdata==2025.3
 uvicorn==0.46.0
 skfolio==0.20.2
+yfinance==0.2.66
