@@ -122,7 +122,7 @@ OPTIMIZATION_PRICE_SOURCE = "yfinance"
 # Internal code prefix → Yahoo Finance suffix.
 _YF_SUFFIX = {"US": "", "NZ": ".NZ", "AU": ".AX", "JP": ".T", "UK": ".L",
               "HK": ".HK", "SG": ".SI", "CA": ".TO", "KR": ".KS", "TW": ".TW",
-              "MY": ".KL", "EU": ".PA"}
+              "MY": ".KL", "EU": ".DE"}
 
 
 def _yf_symbol(code):
